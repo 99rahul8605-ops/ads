@@ -13,7 +13,9 @@ StringSessions are encrypted with Fernet **before** MongoDB receives them. Keep 
 ## Features
 
 - Reply-keyboard menu (not inline callback menu)
-- Multiple Telethon `StringSession` accounts
+- Multiple Telethon accounts
+- Add account by existing `StringSession` **or** direct phone + OTP login
+- Telegram 2FA password flow supported when enabled
 - Sessions encrypted with Fernet and stored in MongoDB
 - Automatic joined group/supergroup scanning
 - Save one promo post: text/photo/video/document/animation
@@ -85,7 +87,9 @@ Re-adding the same Telegram account updates its stored encrypted session instead
 
 ## Menu
 
-- `➕ Add Session` — paste a Telethon StringSession; bot validates then encrypts it into MongoDB
+- `➕ Add Session` — choose either `🔑 Session String` or `📱 Login with Phone`
+  - Session String: paste an existing Telethon StringSession
+  - Login with Phone: phone number → Telegram OTP → 2FA password if enabled → generated StringSession is encrypted and saved automatically
 - `👤 Sessions` — list MongoDB-backed sessions
 - `📝 Save Post` — save promotion post
 - `👁 View Post` — inspect saved post
@@ -98,3 +102,5 @@ Re-adding the same Telegram account updates its stored encrypted session instead
 ## Important
 
 If `FERNET_KEY` changes, previously stored session strings cannot be decrypted. Back up this key securely.
+
+For phone login, OTP and 2FA password are used only for the active login flow and are not stored in MongoDB. The bot also attempts to delete those credential messages from the private admin chat after reading them.

@@ -58,6 +58,17 @@ MENU = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
+ADD_SESSION_MENU = ReplyKeyboardMarkup(
+    [
+        ["🔑 Session String", "📱 Login with Phone"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+login_flows: dict[int, dict] = {}
+
 @dataclass
 class RuntimeStats:
     running: bool = False
@@ -297,6 +308,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cleanup_login_flow(uid: int):
+    flow = login_flows.pop(uid, None)
+    if flow and flow.get("client"):
+        try:
+            await flow["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def save_logged_in_client(client: TelegramClient):
+    me = await client.get_me()
+    session_string = client.session.save()
+    if not session_string:
+        raise RuntimeError("Could not export StringSession")
+    label = f"{me.first_name or 'Account'} ({me.id})"
+    enc = fernet.encrypt(session_string.encode()).decode()
+    await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+    groups = await scan_groups(client)
+    return label, len(groups)
+
+
+async def safe_delete_message(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global promo_task
     if not admin_only(update) or not update.message:
@@ -308,10 +347,37 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Conversation states first
     current = state.get(uid)
+
+    if text == "⬅️ Back":
+        state.pop(uid, None)
+        await cleanup_login_flow(uid)
+        await update.message.reply_text("Main menu.", reply_markup=MENU)
+        return
+
+    if current == "choose_add_method":
+        if text == "🔑 Session String":
+            state[uid] = "await_session"
+            await update.message.reply_text(
+                "Send the Telethon <b>StringSession</b>.\n\nIt will be validated, encrypted, and stored in MongoDB.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ADD_SESSION_MENU,
+            )
+        elif text == "📱 Login with Phone":
+            state[uid] = "await_phone"
+            await update.message.reply_text(
+                "📱 Send the phone number with country code.\nExample: <code>+919876543210</code>\n\n⚠️ The OTP will be entered in this private bot chat. OTP and 2FA password are never stored in the database.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ADD_SESSION_MENU,
+            )
+        else:
+            await update.message.reply_text("Choose one of the two options below.", reply_markup=ADD_SESSION_MENU)
+        return
+
     if current == "await_session":
         state.pop(uid, None)
         session_string = text.strip()
-        msg = await update.message.reply_text("⏳ Validating session...", reply_markup=MENU)
+        await safe_delete_message(update.message)
+        msg = await context.bot.send_message(uid, "⏳ Validating session...", reply_markup=MENU)
         client = None
         try:
             client = await make_client(session_string)
@@ -329,6 +395,88 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             if client:
                 await client.disconnect()
+        return
+
+    if current == "await_phone":
+        phone = text.strip().replace(" ", "")
+        await safe_delete_message(update.message)
+        if not phone.startswith("+") or not phone[1:].isdigit():
+            await context.bot.send_message(uid, "❌ Invalid number. Send it with country code, e.g. <code>+919876543210</code>.", parse_mode=ParseMode.HTML, reply_markup=ADD_SESSION_MENU)
+            return
+        await cleanup_login_flow(uid)
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            login_flows[uid] = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash}
+            state[uid] = "await_otp"
+            await context.bot.send_message(
+                uid,
+                "✅ Login code sent by Telegram.\n\nSend the OTP here. You can type it normally, e.g. <code>12345</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ADD_SESSION_MENU,
+            )
+        except Exception as e:
+            await client.disconnect()
+            state.pop(uid, None)
+            await context.bot.send_message(uid, f"❌ Could not send OTP:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+        return
+
+    if current == "await_otp":
+        code = ''.join(ch for ch in text if ch.isdigit())
+        await safe_delete_message(update.message)
+        flow = login_flows.get(uid)
+        if not flow:
+            state.pop(uid, None)
+            await context.bot.send_message(uid, "❌ Login session expired. Start Add Session again.", reply_markup=MENU)
+            return
+        if not code:
+            await context.bot.send_message(uid, "❌ Send the numeric OTP.", reply_markup=ADD_SESSION_MENU)
+            return
+        client = flow["client"]
+        try:
+            await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["phone_code_hash"])
+            label, count = await save_logged_in_client(client)
+            state.pop(uid, None)
+            await cleanup_login_flow(uid)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups detected: <b>{count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+        except errors.SessionPasswordNeededError:
+            state[uid] = "await_2fa"
+            await context.bot.send_message(uid, "🔐 Two-step verification is enabled. Send your Telegram 2FA password.", reply_markup=ADD_SESSION_MENU)
+        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
+            if isinstance(e, errors.PhoneCodeExpiredError):
+                state.pop(uid, None)
+                await cleanup_login_flow(uid)
+                await context.bot.send_message(uid, "❌ OTP expired. Start Add Session again to request a new code.", reply_markup=MENU)
+            else:
+                await context.bot.send_message(uid, "❌ Wrong OTP. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
+        except Exception as e:
+            state.pop(uid, None)
+            await cleanup_login_flow(uid)
+            await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+        return
+
+    if current == "await_2fa":
+        password = text
+        await safe_delete_message(update.message)
+        flow = login_flows.get(uid)
+        if not flow:
+            state.pop(uid, None)
+            await context.bot.send_message(uid, "❌ Login session expired. Start Add Session again.", reply_markup=MENU)
+            return
+        client = flow["client"]
+        try:
+            await client.sign_in(password=password)
+            label, count = await save_logged_in_client(client)
+            state.pop(uid, None)
+            await cleanup_login_flow(uid)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups detected: <b>{count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+        except errors.PasswordHashInvalidError:
+            await context.bot.send_message(uid, "❌ Wrong 2FA password. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
+        except Exception as e:
+            state.pop(uid, None)
+            await cleanup_login_flow(uid)
+            await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
 
     if current == "await_interval":
@@ -356,11 +504,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "➕ Add Session":
-        state[uid] = "await_session"
+        state[uid] = "choose_add_method"
         await update.message.reply_text(
-            "Send the Telethon <b>StringSession</b>.\n\nIt will be encrypted before being stored in MongoDB.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=MENU,
+            "How do you want to add the Telegram account?",
+            reply_markup=ADD_SESSION_MENU,
         )
 
     elif text == "👤 Sessions":
