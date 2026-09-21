@@ -104,3 +104,10 @@ Re-adding the same Telegram account updates its stored encrypted session instead
 If `FERNET_KEY` changes, previously stored session strings cannot be decrypted. Back up this key securely.
 
 For phone login, OTP and 2FA password are used only for the active login flow and are not stored in MongoDB. The bot also attempts to delete those credential messages from the private admin chat after reading them.
+
+
+## Private user targets
+
+Private users are not taken from every old dialog automatically. A user becomes a recurring private promotion target only when they send `/subscribe` to the connected Telegram account. Sending `/unsubscribe` removes them from the target set. The scanner checks recent inbound history to determine the latest subscription state.
+
+Live stats show group and private-user totals separately.

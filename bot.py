@@ -50,7 +50,7 @@ MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Session", "👤 Sessions"],
         ["📝 Save Post", "👁 View Post"],
-        ["⏱ Interval", "🔄 Rescan Groups"],
+        ["⏱ Interval", "🔄 Rescan Targets"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["📊 Live Stats", "🗑 Remove Session"],
     ],
@@ -77,6 +77,15 @@ class RuntimeStats:
     current_session: str = "-"
     current_group: str = "-"
     total_groups: int = 0
+    total_users: int = 0
+    group_attempted: int = 0
+    group_sent: int = 0
+    group_failed: int = 0
+    group_skipped: int = 0
+    user_attempted: int = 0
+    user_sent: int = 0
+    user_failed: int = 0
+    user_skipped: int = 0
     attempted: int = 0
     sent: int = 0
     failed: int = 0
@@ -85,6 +94,7 @@ class RuntimeStats:
     last_error: str = "-"
     next_round_at: float | None = None
     cached_group_count: dict = field(default_factory=dict)
+    cached_user_count: dict = field(default_factory=dict)
 
 stats = RuntimeStats()
 promo_task: asyncio.Task | None = None
@@ -111,7 +121,8 @@ def fmt_duration(sec: float) -> str:
 
 
 def stats_text() -> str:
-    pct = (stats.attempted / stats.total_groups * 100) if stats.total_groups else 0
+    total_targets = stats.total_groups + stats.total_users
+    pct = (stats.attempted / total_targets * 100) if total_targets else 0
     elapsed = fmt_duration(time.time() - stats.started_at) if stats.started_at else "-"
     next_run = "-"
     if stats.next_round_at:
@@ -120,13 +131,16 @@ def stats_text() -> str:
         "📊 <b>LIVE PROMOTION STATS</b>\n\n"
         f"Status: {'🟢 Running' if stats.running else '🔴 Stopped'}\n"
         f"Round: <b>{stats.round_no}</b>\n"
-        f"Progress: <b>{stats.attempted}/{stats.total_groups}</b> ({pct:.1f}%)\n"
-        f"✅ Sent: <b>{stats.sent}</b>\n"
-        f"❌ Failed: <b>{stats.failed}</b>\n"
-        f"⏭ Skipped: <b>{stats.skipped}</b>\n"
-        f"⏳ Flood waits: <b>{stats.flood_waits}</b>\n\n"
-        f"👤 Session: <code>{esc(stats.current_session)}</code>\n"
-        f"👥 Current: {esc(stats.current_group)}\n"
+        f"Overall: <b>{stats.attempted}/{total_targets}</b> ({pct:.1f}%)\n\n"
+        "👥 <b>GROUPS</b>\n"
+        f"Total: <b>{stats.total_groups}</b> | Tried: <b>{stats.group_attempted}</b>\n"
+        f"✅ {stats.group_sent}  ❌ {stats.group_failed}  ⏭ {stats.group_skipped}\n\n"
+        "👤 <b>OPT-IN USERS</b>\n"
+        f"Total: <b>{stats.total_users}</b> | Tried: <b>{stats.user_attempted}</b>\n"
+        f"✅ {stats.user_sent}  ❌ {stats.user_failed}  ⏭ {stats.user_skipped}\n\n"
+        f"⏳ Flood waits: <b>{stats.flood_waits}</b>\n"
+        f"🔐 Session: <code>{esc(stats.current_session)}</code>\n"
+        f"🎯 Current: {esc(stats.current_group)}\n"
         f"⏱ Elapsed: {elapsed}\n"
         f"🔁 Next round in: {next_run}\n"
         f"⚠️ Last error: <code>{esc(stats.last_error)[:500]}</code>"
@@ -161,6 +175,39 @@ async def scan_groups(client: TelegramClient):
     return groups
 
 
+
+
+async def scan_opted_in_users(client: TelegramClient):
+    """Return private users who explicitly opted in by sending /subscribe.
+
+    The newest inbound /subscribe or /unsubscribe command found in recent history
+    decides the state. Bots, deleted users, and the account itself are excluded.
+    """
+    users = []
+    me = await client.get_me()
+    async for dialog in client.iter_dialogs(limit=None):
+        entity = dialog.entity
+        if not isinstance(entity, types.User):
+            continue
+        if entity.id == me.id or getattr(entity, "bot", False) or getattr(entity, "deleted", False):
+            continue
+        opted_in = None
+        try:
+            async for msg in client.iter_messages(entity, limit=30):
+                if msg.out or not msg.raw_text:
+                    continue
+                cmd = msg.raw_text.strip().lower().split()[0]
+                if cmd in {"/subscribe", "/unsubscribe"}:
+                    opted_in = cmd == "/subscribe"
+                    break
+        except Exception:
+            continue
+        if opted_in:
+            name = " ".join(x for x in [getattr(entity, "first_name", None), getattr(entity, "last_name", None)] if x)
+            users.append((entity, name or getattr(entity, "username", None) or str(entity.id)))
+    return users
+
+
 async def send_saved_post(client: TelegramClient, entity, post: dict):
     text = post.get("html_text") or ""
     media_path = post.get("media_path")
@@ -187,8 +234,11 @@ async def do_round(app: Application):
 
     stats.round_no += 1
     stats.started_at = time.time()
+    stats.group_attempted = stats.group_sent = stats.group_failed = stats.group_skipped = 0
+    stats.user_attempted = stats.user_sent = stats.user_failed = stats.user_skipped = 0
     stats.attempted = stats.sent = stats.failed = stats.skipped = stats.flood_waits = 0
     stats.total_groups = 0
+    stats.total_users = 0
     stats.last_error = "-"
 
     prepared = []
@@ -199,9 +249,12 @@ async def do_round(app: Application):
             session_string = decrypt_session(row["session_enc"])
             client = await make_client(session_string)
             groups = await scan_groups(client)
+            users = await scan_opted_in_users(client)
             stats.cached_group_count[row["id"]] = len(groups)
-            prepared.append((row, client, groups))
+            stats.cached_user_count[row["id"]] = len(users)
+            prepared.append((row, client, groups, users))
             stats.total_groups += len(groups)
+            stats.total_users += len(users)
         except Exception as e:
             stats.failed += 1
             stats.last_error = f"{label}: {type(e).__name__}: {e}"
@@ -219,37 +272,62 @@ async def do_round(app: Application):
         pass
 
     last_edit = 0.0
-    for row, client, groups in prepared:
+    for row, client, groups, users in prepared:
         try:
             stats.current_session = row["label"]
-            for entity, name in groups:
+            targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
+            for target_type, entity, name in targets:
                 if not stats.running:
                     return
-                stats.current_group = name
+                prefix = "👥" if target_type == "group" else "👤"
+                stats.current_group = f"{prefix} {name}"
                 try:
                     await send_saved_post(client, entity, post)
                     stats.sent += 1
+                    if target_type == "group":
+                        stats.group_sent += 1
+                    else:
+                        stats.user_sent += 1
                 except errors.FloodWaitError as e:
                     stats.flood_waits += 1
                     stats.last_error = f"FloodWait {e.seconds}s at {name}"
-                    # Respect Telegram's required wait; no bypass/retry tricks.
                     await asyncio.sleep(e.seconds)
                     if not stats.running:
                         return
                     try:
                         await send_saved_post(client, entity, post)
                         stats.sent += 1
+                        if target_type == "group":
+                            stats.group_sent += 1
+                        else:
+                            stats.user_sent += 1
                     except Exception as retry_e:
                         stats.failed += 1
+                        if target_type == "group":
+                            stats.group_failed += 1
+                        else:
+                            stats.user_failed += 1
                         stats.last_error = f"{type(retry_e).__name__}: {retry_e}"
                 except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError, errors.ChatAdminRequiredError) as e:
                     stats.skipped += 1
+                    if target_type == "group":
+                        stats.group_skipped += 1
+                    else:
+                        stats.user_skipped += 1
                     stats.last_error = f"{type(e).__name__}: {name}"
                 except Exception as e:
                     stats.failed += 1
+                    if target_type == "group":
+                        stats.group_failed += 1
+                    else:
+                        stats.user_failed += 1
                     stats.last_error = f"{type(e).__name__}: {e}"
                 finally:
                     stats.attempted += 1
+                    if target_type == "group":
+                        stats.group_attempted += 1
+                    else:
+                        stats.user_attempted += 1
 
                 now = time.time()
                 if progress_msg and now - last_edit >= 3:
@@ -302,7 +380,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return
     await update.message.reply_text(
-        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are detected automatically; private chats and broadcast channels are not included.",
+        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are detected automatically. Private users are included only after they send <code>/subscribe</code> to that Telegram account; <code>/unsubscribe</code> removes them.",
         parse_mode=ParseMode.HTML,
         reply_markup=MENU,
     )
@@ -326,7 +404,8 @@ async def save_logged_in_client(client: TelegramClient):
     enc = fernet.encrypt(session_string.encode()).decode()
     await session_store.add_session(label, enc, me.id, me.username, me.first_name)
     groups = await scan_groups(client)
-    return label, len(groups)
+    users = await scan_opted_in_users(client)
+    return label, len(groups), len(users)
 
 
 async def safe_delete_message(message):
@@ -386,8 +465,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             enc = fernet.encrypt(session_string.encode()).decode()
             await session_store.add_session(label, enc, me.id, me.username, me.first_name)
             groups = await scan_groups(client)
+            users = await scan_opted_in_users(client)
             await msg.edit_text(
-                f"✅ Session added.\n\n👤 {esc(label)}\n👥 Joined groups detected: <b>{len(groups)}</b>",
+                f"✅ Session added.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{len(groups)}</b>\n👤 Opt-in users: <b>{len(users)}</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -436,10 +516,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = flow["client"]
         try:
             await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["phone_code_hash"])
-            label, count = await save_logged_in_client(client)
+            label, group_count, user_count = await save_logged_in_client(client)
             state.pop(uid, None)
             await cleanup_login_flow(uid)
-            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups detected: <b>{count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{group_count}</b>\n👤 Opt-in users: <b>{user_count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.SessionPasswordNeededError:
             state[uid] = "await_2fa"
             await context.bot.send_message(uid, "🔐 Two-step verification is enabled. Send your Telegram 2FA password.", reply_markup=ADD_SESSION_MENU)
@@ -467,10 +547,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = flow["client"]
         try:
             await client.sign_in(password=password)
-            label, count = await save_logged_in_client(client)
+            label, group_count, user_count = await save_logged_in_client(client)
             state.pop(uid, None)
             await cleanup_login_flow(uid)
-            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups detected: <b>{count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{group_count}</b>\n👤 Opt-in users: <b>{user_count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.PasswordHashInvalidError:
             await context.bot.send_message(uid, "❌ Wrong 2FA password. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
         except Exception as e:
@@ -517,9 +597,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["👤 <b>SESSIONS</b>\n"]
         for r in rows:
-            count = stats.cached_group_count.get(r["id"], "?")
+            gcount = stats.cached_group_count.get(r["id"], "?")
+            ucount = stats.cached_user_count.get(r["id"], "?")
             uname = f"@{r['username']}" if r.get("username") else "no username"
-            lines.append(f"#{r['id']} • {esc(r['first_name'] or r['label'])} • {esc(uname)} • groups: {count}")
+            lines.append(f"#{r['id']} • {esc(r['first_name'] or r['label'])} • {esc(uname)} • groups: {gcount} • users: {ucount}")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "🗑 Remove Session":
@@ -554,28 +635,32 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MENU,
         )
 
-    elif text == "🔄 Rescan Groups":
+    elif text == "🔄 Rescan Targets":
         rows = await session_store.get_sessions(enabled_only=True)
         if not rows:
             await update.message.reply_text("No sessions added.", reply_markup=MENU)
             return
-        msg = await update.message.reply_text("⏳ Scanning joined groups...", reply_markup=MENU)
+        msg = await update.message.reply_text("⏳ Scanning joined groups + opt-in users...", reply_markup=MENU)
         out = []
-        total = 0
+        total_groups = 0
+        total_users = 0
         for r in rows:
             client = None
             try:
                 client = await make_client(decrypt_session(r["session_enc"]))
                 groups = await scan_groups(client)
+                users = await scan_opted_in_users(client)
                 stats.cached_group_count[r["id"]] = len(groups)
-                total += len(groups)
-                out.append(f"✅ {r['label']}: {len(groups)}")
+                stats.cached_user_count[r["id"]] = len(users)
+                total_groups += len(groups)
+                total_users += len(users)
+                out.append(f"✅ {r['label']}: {len(groups)} groups, {len(users)} users")
             except Exception as e:
                 out.append(f"❌ {r['label']}: {type(e).__name__}")
             finally:
                 if client:
                     await client.disconnect()
-        await msg.edit_text("🔄 <b>SCAN COMPLETE</b>\n\n" + "\n".join(map(esc, out)) + f"\n\nTotal: <b>{total}</b>", parse_mode=ParseMode.HTML)
+        await msg.edit_text("🔄 <b>SCAN COMPLETE</b>\n\n" + "\n".join(map(esc, out)) + f"\n\n👥 Groups: <b>{total_groups}</b>\n👤 Opt-in users: <b>{total_users}</b>", parse_mode=ParseMode.HTML)
 
     elif text == "▶️ Start Promo":
         if promo_task and not promo_task.done():
