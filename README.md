@@ -111,3 +111,13 @@ For phone login, OTP and 2FA password are used only for the active login flow an
 Private users are not taken from every old dialog automatically. A user becomes a recurring private promotion target only when they send `/subscribe` to the connected Telegram account. Sending `/unsubscribe` removes them from the target set. The scanner checks recent inbound history to determine the latest subscription state.
 
 Live stats show group and private-user totals separately.
+
+
+## Flood-wait / target-cache behavior
+
+- Joined dialogs are not fetched on every promotion round.
+- First Start Promo builds an in-memory target cache; following rounds reuse it.
+- Manual `Rescan Targets` forces a fresh scan.
+- Default automatic cache refresh is 6 hours (`TARGET_CACHE_TTL_SECONDS=21600`).
+- Sessions broadcast in parallel; targets inside one session are sent sequentially with `GROUP_DELAY_SECONDS`.
+- Telegram FloodWait is never bypassed; only the affected session worker sleeps for the required time.

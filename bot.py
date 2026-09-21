@@ -64,6 +64,11 @@ def configure_logging():
         for h in list(noisy.handlers):
             noisy.removeHandler(h)
 
+
+    # Telethon logs automatic flood-wait sleeps at INFO. Keep warnings/errors,
+    # while the cache below prevents repeated GetDialogsRequest calls.
+    logging.getLogger("telethon.client.users").setLevel(logging.WARNING)
+
     formatter = SecretRedactingFormatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         [BOT_TOKEN, API_HASH, MONGO_URI, FERNET_KEY.decode("utf-8", errors="ignore")],
@@ -88,7 +93,8 @@ MENU = ReplyKeyboardMarkup(
         ["📝 Save Post", "👁 View Post"],
         ["⏱ Interval", "🔄 Rescan Targets"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
-        ["📊 Live Stats", "🗑 Remove Session"],
+        ["📊 Live Stats", "📨 DM Broadcast"],
+        ["🗑 Remove Session"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -104,6 +110,11 @@ ADD_SESSION_MENU = ReplyKeyboardMarkup(
 )
 
 login_flows: dict[int, dict] = {}
+# In-memory target cache: session Mongo ID -> {groups, users, scanned_at}.
+# Cached InputPeer objects avoid a fresh GetDialogsRequest on every promotion round.
+target_cache: dict[str, dict] = {}
+TARGET_CACHE_TTL = max(300, int(os.getenv("TARGET_CACHE_TTL_SECONDS", "21600")))
+scan_locks: dict[str, asyncio.Lock] = {}
 
 @dataclass
 class RuntimeStats:
@@ -199,26 +210,37 @@ def decrypt_session(value: str) -> str:
         raise RuntimeError("FERNET_KEY does not match stored sessions") from e
 
 
-async def scan_groups(client: TelegramClient):
+async def _input_peer(entity):
+    """Build a reusable InputPeer so later rounds do not need entity resolution."""
+    if isinstance(entity, types.Chat):
+        return types.InputPeerChat(entity.id)
+    if isinstance(entity, types.Channel):
+        return types.InputPeerChannel(entity.id, entity.access_hash or 0)
+    if isinstance(entity, types.User):
+        return types.InputPeerUser(entity.id, entity.access_hash or 0)
+    return entity
+
+
+async def scan_targets(client: TelegramClient):
+    """Scan dialogs once and cache joined groups only for recurring promotion.
+
+    Private dialogs are intentionally not part of the recurring scheduler. A separate
+    one-time DM broadcast action can scan existing private dialogs when explicitly used.
+    """
     groups = []
     async for dialog in client.iter_dialogs(limit=None):
         entity = dialog.entity
-        # Basic groups and megagroups only. Broadcast channels and private chats are excluded.
+        name = dialog.name or str(dialog.id)
         if isinstance(entity, types.Chat):
-            groups.append((entity, dialog.name or str(dialog.id)))
-        elif isinstance(entity, types.Channel) and getattr(entity, "megagroup", False):
-            groups.append((entity, dialog.name or str(dialog.id)))
-    return groups
+            groups.append((await _input_peer(entity), name))
+            continue
+        if isinstance(entity, types.Channel) and getattr(entity, "megagroup", False):
+            groups.append((await _input_peer(entity), name))
+    return groups, []
 
 
-
-
-async def scan_opted_in_users(client: TelegramClient):
-    """Return private users who explicitly opted in by sending /subscribe.
-
-    The newest inbound /subscribe or /unsubscribe command found in recent history
-    decides the state. Bots, deleted users, and the account itself are excluded.
-    """
+async def scan_existing_dm_users(client: TelegramClient):
+    """Return existing private user dialogs with one GetDialogs traversal."""
     users = []
     me = await client.get_me()
     async for dialog in client.iter_dialogs(limit=None):
@@ -227,21 +249,25 @@ async def scan_opted_in_users(client: TelegramClient):
             continue
         if entity.id == me.id or getattr(entity, "bot", False) or getattr(entity, "deleted", False):
             continue
-        opted_in = None
-        try:
-            async for msg in client.iter_messages(entity, limit=30):
-                if msg.out or not msg.raw_text:
-                    continue
-                cmd = msg.raw_text.strip().lower().split()[0]
-                if cmd in {"/subscribe", "/unsubscribe"}:
-                    opted_in = cmd == "/subscribe"
-                    break
-        except Exception:
-            continue
-        if opted_in:
-            name = " ".join(x for x in [getattr(entity, "first_name", None), getattr(entity, "last_name", None)] if x)
-            users.append((entity, name or getattr(entity, "username", None) or str(entity.id)))
+        display = " ".join(x for x in [getattr(entity, "first_name", None), getattr(entity, "last_name", None)] if x)
+        users.append((await _input_peer(entity), display or getattr(entity, "username", None) or str(entity.id)))
     return users
+
+
+async def get_cached_targets(row: dict, client: TelegramClient, force: bool = False):
+    """Return cached targets, refreshing at most once per TTL unless force=True."""
+    sid = str(row["id"])
+    lock = scan_locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        cached = target_cache.get(sid)
+        now = time.time()
+        if cached and not force and now - cached["scanned_at"] < TARGET_CACHE_TTL:
+            return cached["groups"], cached["users"], False
+        groups, users = await scan_targets(client)
+        target_cache[sid] = {"groups": groups, "users": users, "scanned_at": now}
+        stats.cached_group_count[row["id"]] = len(groups)
+        stats.cached_user_count[row["id"]] = len(users)
+        return groups, users, True
 
 
 async def send_saved_post(client: TelegramClient, entity, post: dict):
@@ -258,6 +284,79 @@ async def send_saved_post(client: TelegramClient, entity, post: dict):
         )
     else:
         await client.send_message(entity, text, parse_mode="html", link_preview=False)
+
+
+async def _run_session_round(row, client, groups, users, post, progress_msg, edit_lock):
+    """One session worker. Targets are sequential; session workers run in parallel."""
+    targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
+    last_edit = 0.0
+    try:
+        for target_type, entity, name in targets:
+            if not stats.running:
+                return
+            stats.current_session = row["label"]
+            prefix = "👥" if target_type == "group" else "👤"
+            stats.current_group = f"{prefix} {name}"
+            try:
+                await send_saved_post(client, entity, post)
+                stats.sent += 1
+                if target_type == "group":
+                    stats.group_sent += 1
+                else:
+                    stats.user_sent += 1
+            except errors.FloodWaitError as e:
+                # Telegram's server-mandated wait is respected for only this session worker.
+                stats.flood_waits += 1
+                stats.last_error = f"{row['label']}: FloodWait {e.seconds}s at {name}"
+                await asyncio.sleep(e.seconds)
+                if not stats.running:
+                    return
+                try:
+                    await send_saved_post(client, entity, post)
+                    stats.sent += 1
+                    if target_type == "group":
+                        stats.group_sent += 1
+                    else:
+                        stats.user_sent += 1
+                except Exception as retry_e:
+                    stats.failed += 1
+                    if target_type == "group":
+                        stats.group_failed += 1
+                    else:
+                        stats.user_failed += 1
+                    stats.last_error = f"{row['label']}: {type(retry_e).__name__}: {retry_e}"
+            except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError, errors.ChatAdminRequiredError):
+                stats.skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
+                stats.last_error = f"{row['label']}: write not allowed: {name}"
+            except Exception as e:
+                stats.failed += 1
+                if target_type == "group":
+                    stats.group_failed += 1
+                else:
+                    stats.user_failed += 1
+                stats.last_error = f"{row['label']}: {type(e).__name__}: {e}"
+            finally:
+                stats.attempted += 1
+                if target_type == "group":
+                    stats.group_attempted += 1
+                else:
+                    stats.user_attempted += 1
+
+            now = time.time()
+            if progress_msg and now - last_edit >= 3:
+                async with edit_lock:
+                    try:
+                        await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+                last_edit = now
+            await asyncio.sleep(GROUP_DELAY_SECONDS)
+    finally:
+        await client.disconnect()
 
 
 async def do_round(app: Application):
@@ -278,109 +377,144 @@ async def do_round(app: Application):
     stats.last_error = "-"
 
     prepared = []
-    for row in sessions:
-        label = row["label"]
+    # Connect sessions concurrently. A target scan occurs only when cache is missing/stale.
+    async def prepare(row):
         client = None
         try:
-            session_string = decrypt_session(row["session_enc"])
-            client = await make_client(session_string)
-            groups = await scan_groups(client)
-            users = await scan_opted_in_users(client)
-            stats.cached_group_count[row["id"]] = len(groups)
-            stats.cached_user_count[row["id"]] = len(users)
-            prepared.append((row, client, groups, users))
-            stats.total_groups += len(groups)
-            stats.total_users += len(users)
+            client = await make_client(decrypt_session(row["session_enc"]))
+            groups, users, _ = await get_cached_targets(row, client, force=False)
+            return row, client, groups, users, None
         except Exception as e:
-            stats.failed += 1
-            stats.last_error = f"{label}: {type(e).__name__}: {e}"
             if client:
                 await client.disconnect()
+            return row, None, [], [], e
+
+    results = await asyncio.gather(*(prepare(row) for row in sessions))
+    for row, client, groups, users, err in results:
+        if err:
+            stats.failed += 1
+            stats.last_error = f"{row['label']}: {type(err).__name__}: {err}"
+            continue
+        prepared.append((row, client, groups, users))
+        stats.total_groups += len(groups)
+        stats.total_users += len(users)
 
     progress_msg = None
     try:
-        progress_msg = await app.bot.send_message(
-            ADMIN_ID,
-            stats_text(),
-            parse_mode=ParseMode.HTML,
-        )
+        progress_msg = await app.bot.send_message(ADMIN_ID, stats_text(), parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
-    last_edit = 0.0
-    for row, client, groups, users in prepared:
-        try:
-            stats.current_session = row["label"]
-            targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
-            for target_type, entity, name in targets:
-                if not stats.running:
-                    return
-                prefix = "👥" if target_type == "group" else "👤"
-                stats.current_group = f"{prefix} {name}"
-                try:
-                    await send_saved_post(client, entity, post)
-                    stats.sent += 1
-                    if target_type == "group":
-                        stats.group_sent += 1
-                    else:
-                        stats.user_sent += 1
-                except errors.FloodWaitError as e:
-                    stats.flood_waits += 1
-                    stats.last_error = f"FloodWait {e.seconds}s at {name}"
-                    await asyncio.sleep(e.seconds)
-                    if not stats.running:
-                        return
-                    try:
-                        await send_saved_post(client, entity, post)
-                        stats.sent += 1
-                        if target_type == "group":
-                            stats.group_sent += 1
-                        else:
-                            stats.user_sent += 1
-                    except Exception as retry_e:
-                        stats.failed += 1
-                        if target_type == "group":
-                            stats.group_failed += 1
-                        else:
-                            stats.user_failed += 1
-                        stats.last_error = f"{type(retry_e).__name__}: {retry_e}"
-                except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError, errors.ChatAdminRequiredError) as e:
-                    stats.skipped += 1
-                    if target_type == "group":
-                        stats.group_skipped += 1
-                    else:
-                        stats.user_skipped += 1
-                    stats.last_error = f"{type(e).__name__}: {name}"
-                except Exception as e:
-                    stats.failed += 1
-                    if target_type == "group":
-                        stats.group_failed += 1
-                    else:
-                        stats.user_failed += 1
-                    stats.last_error = f"{type(e).__name__}: {e}"
-                finally:
-                    stats.attempted += 1
-                    if target_type == "group":
-                        stats.group_attempted += 1
-                    else:
-                        stats.user_attempted += 1
-
-                now = time.time()
-                if progress_msg and now - last_edit >= 3:
-                    try:
-                        await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
-                    except Exception:
-                        pass
-                    last_edit = now
-                await asyncio.sleep(GROUP_DELAY_SECONDS)
-        finally:
-            await client.disconnect()
+    edit_lock = asyncio.Lock()
+    # All sessions run simultaneously; each individual session sends sequentially.
+    await asyncio.gather(*(_run_session_round(row, client, groups, users, post, progress_msg, edit_lock)
+                           for row, client, groups, users in prepared))
 
     if progress_msg:
         try:
             await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
+
+async def run_one_time_dm_broadcast(app: Application):
+    """Send the saved post once to existing private DM dialogs, with per-session parallelism."""
+    sessions = await session_store.get_sessions(enabled_only=True)
+    post = await db.get_post()
+    if not sessions:
+        raise RuntimeError("No active sessions")
+    if not post:
+        raise RuntimeError("No promo post saved")
+
+    stats.started_at = time.time()
+    stats.current_group = "-"
+    stats.group_attempted = stats.group_sent = stats.group_failed = stats.group_skipped = 0
+    stats.user_attempted = stats.user_sent = stats.user_failed = stats.user_skipped = 0
+    stats.attempted = stats.sent = stats.failed = stats.skipped = stats.flood_waits = 0
+    stats.total_groups = 0
+    stats.total_users = 0
+    stats.last_error = "-"
+
+    prepared = []
+    async def prepare_dm(row):
+        client = None
+        try:
+            client = await make_client(decrypt_session(row["session_enc"]))
+            users = await scan_existing_dm_users(client)
+            return row, client, users, None
+        except Exception as e:
+            if client:
+                await client.disconnect()
+            return row, None, [], e
+
+    results = await asyncio.gather(*(prepare_dm(row) for row in sessions))
+    for row, client, users, err in results:
+        if err:
+            stats.failed += 1
+            stats.last_error = f"{row['label']}: {type(err).__name__}: {err}"
+            continue
+        prepared.append((row, client, users))
+        stats.total_users += len(users)
+
+    progress_msg = None
+    try:
+        progress_msg = await app.bot.send_message(ADMIN_ID, "📨 <b>DM BROADCAST STARTED</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+    edit_lock = asyncio.Lock()
+
+    async def worker(row, client, users):
+        last_edit = 0.0
+        try:
+            for entity, name in users:
+                stats.current_session = row["label"]
+                stats.current_group = f"👤 {name}"
+                try:
+                    await send_saved_post(client, entity, post)
+                    stats.sent += 1
+                    stats.user_sent += 1
+                except errors.FloodWaitError as e:
+                    stats.flood_waits += 1
+                    stats.last_error = f"{row['label']}: FloodWait {e.seconds}s at {name}"
+                    await asyncio.sleep(e.seconds)
+                    try:
+                        await send_saved_post(client, entity, post)
+                        stats.sent += 1
+                        stats.user_sent += 1
+                    except Exception as retry_e:
+                        stats.failed += 1
+                        stats.user_failed += 1
+                        stats.last_error = f"{row['label']}: {type(retry_e).__name__}: {retry_e}"
+                except Exception as e:
+                    stats.failed += 1
+                    stats.user_failed += 1
+                    stats.last_error = f"{row['label']}: {type(e).__name__}: {e}"
+                finally:
+                    stats.attempted += 1
+                    stats.user_attempted += 1
+
+                now = time.time()
+                if progress_msg and now - last_edit >= 3:
+                    async with edit_lock:
+                        try:
+                            await progress_msg.edit_text("📨 <b>DM BROADCAST</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+                        except Exception:
+                            pass
+                    last_edit = now
+                await asyncio.sleep(GROUP_DELAY_SECONDS)
+        finally:
+            await client.disconnect()
+
+    await asyncio.gather(*(worker(row, client, users) for row, client, users in prepared))
+    stats.current_group = "-"
+    stats.current_session = "-"
+    if progress_msg:
+        try:
+            await progress_msg.edit_text("✅ <b>DM BROADCAST COMPLETE</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
 
 
 async def scheduler(app: Application):
@@ -416,7 +550,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return
     await update.message.reply_text(
-        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are detected automatically. Private users are included only after they send <code>/subscribe</code> to that Telegram account; <code>/unsubscribe</code> removes them.",
+        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are cached so every promo round does not rescan dialogs. Recurring scheduler targets joined groups only. Use 📨 DM Broadcast for a one-time send to existing private dialogs.",
         parse_mode=ParseMode.HTML,
         reply_markup=MENU,
     )
@@ -439,9 +573,9 @@ async def save_logged_in_client(client: TelegramClient):
     label = f"{me.first_name or 'Account'} ({me.id})"
     enc = fernet.encrypt(session_string.encode()).decode()
     await session_store.add_session(label, enc, me.id, me.username, me.first_name)
-    groups = await scan_groups(client)
-    users = await scan_opted_in_users(client)
-    return label, len(groups), len(users)
+    # Do not scan dialogs here. The cache is built on first Start or manual Rescan,
+    # which avoids duplicate GetDialogsRequest bursts during account setup.
+    return label, None, None
 
 
 async def safe_delete_message(message):
@@ -500,10 +634,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{me.first_name or 'Account'} ({me.id})"
             enc = fernet.encrypt(session_string.encode()).decode()
             await session_store.add_session(label, enc, me.id, me.username, me.first_name)
-            groups = await scan_groups(client)
-            users = await scan_opted_in_users(client)
             await msg.edit_text(
-                f"✅ Session added.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{len(groups)}</b>\n👤 Opt-in users: <b>{len(users)}</b>",
+                f"✅ Session added.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -555,7 +687,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label, group_count, user_count = await save_logged_in_client(client)
             state.pop(uid, None)
             await cleanup_login_flow(uid)
-            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{group_count}</b>\n👤 Opt-in users: <b>{user_count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.SessionPasswordNeededError:
             state[uid] = "await_2fa"
             await context.bot.send_message(uid, "🔐 Two-step verification is enabled. Send your Telegram 2FA password.", reply_markup=ADD_SESSION_MENU)
@@ -586,7 +718,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label, group_count, user_count = await save_logged_in_client(client)
             state.pop(uid, None)
             await cleanup_login_flow(uid)
-            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n👥 Joined groups: <b>{group_count}</b>\n👤 Opt-in users: <b>{user_count}</b>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+            await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.PasswordHashInvalidError:
             await context.bot.send_message(uid, "❌ Wrong 2FA password. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
         except Exception as e:
@@ -612,6 +744,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             session_ref = text.strip()
             deleted = await session_store.delete_session(session_ref)
+            target_cache.clear()
             if not deleted:
                 raise ValueError("Session not found")
             await update.message.reply_text(f"✅ Session {session_ref} removed.", reply_markup=MENU)
@@ -676,7 +809,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("No sessions added.", reply_markup=MENU)
             return
-        msg = await update.message.reply_text("⏳ Scanning joined groups + opt-in users...")
+        msg = await update.message.reply_text("⏳ Refreshing recurring group target cache...")
         out = []
         total_groups = 0
         total_users = 0
@@ -684,13 +817,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client = None
             try:
                 client = await make_client(decrypt_session(r["session_enc"]))
-                groups = await scan_groups(client)
-                users = await scan_opted_in_users(client)
-                stats.cached_group_count[r["id"]] = len(groups)
-                stats.cached_user_count[r["id"]] = len(users)
+                groups, users, _ = await get_cached_targets(r, client, force=True)
                 total_groups += len(groups)
                 total_users += len(users)
-                out.append(f"✅ {r['label']}: {len(groups)} groups, {len(users)} users")
+                out.append(f"✅ {r['label']}: {len(groups)} groups")
             except Exception as e:
                 out.append(f"❌ {r['label']}: {type(e).__name__}")
             finally:
@@ -699,7 +829,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scan_text = (
             "🔄 <b>SCAN COMPLETE</b>\n\n"
             + "\n".join(map(esc, out))
-            + f"\n\n👥 Groups: <b>{total_groups}</b>\n👤 Opt-in users: <b>{total_users}</b>"
+            + f"\n\n👥 Groups: <b>{total_groups}</b>"
         )
         try:
             await msg.edit_text(scan_text, parse_mode=ParseMode.HTML)
@@ -731,6 +861,19 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         promo_task = None
         await update.message.reply_text("⏹ Promotion stopped.", reply_markup=MENU)
+
+    elif text == "📨 DM Broadcast":
+        if stats.running:
+            await update.message.reply_text("⏹ Stop the recurring group promotion before running a one-time DM broadcast.", reply_markup=MENU)
+            return
+        if not await db.get_post():
+            await update.message.reply_text("❌ Save a promotion post first.", reply_markup=MENU)
+            return
+        if not await session_store.get_sessions(enabled_only=True):
+            await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
+            return
+        await update.message.reply_text("📨 One-time broadcast to existing private DM dialogs started. Use 📊 Live Stats for progress.", reply_markup=MENU)
+        asyncio.create_task(run_one_time_dm_broadcast(context.application), name="one_time_dm_broadcast")
 
     elif text == "📊 Live Stats":
         await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML, reply_markup=MENU)
