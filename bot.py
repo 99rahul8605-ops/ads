@@ -10,6 +10,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,11 +24,6 @@ from telethon.sessions import StringSession
 from database import Database, MongoSessionStore
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("promo-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
@@ -42,6 +38,46 @@ GROUP_DELAY_SECONDS = max(3, int(os.getenv("GROUP_DELAY_SECONDS", "8")))
 FERNET_KEY = os.environ["FERNET_KEY"].encode()
 fernet = Fernet(FERNET_KEY)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class SecretRedactingFormatter(logging.Formatter):
+    """Redact secrets even when they appear inside exception tracebacks or URLs."""
+
+    def __init__(self, fmt: str, secrets: list[str]):
+        super().__init__(fmt)
+        self._secrets = [x for x in secrets if x]
+
+    def format(self, record):
+        text = super().format(record)
+        for secret in self._secrets:
+            text = text.replace(secret, "[REDACTED]")
+        return text
+
+
+def configure_logging():
+    # HTTPX logs Telegram Bot API URLs; those URLs contain the bot token.
+    # Keep request-level libraries quiet and redact secrets from every root log.
+    for name in ("httpx", "httpcore"):
+        noisy = logging.getLogger(name)
+        noisy.setLevel(logging.CRITICAL)
+        noisy.propagate = False
+        for h in list(noisy.handlers):
+            noisy.removeHandler(h)
+
+    formatter = SecretRedactingFormatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        [BOT_TOKEN, API_HASH, MONGO_URI, FERNET_KEY.decode("utf-8", errors="ignore")],
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        root.addHandler(logging.StreamHandler())
+    for handler in root.handlers:
+        handler.setFormatter(formatter)
+
+
+configure_logging()
+log = logging.getLogger("promo-bot")
 
 db = Database(DB_PATH)
 session_store = MongoSessionStore(MONGO_URI, MONGO_DB)
@@ -640,7 +676,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("No sessions added.", reply_markup=MENU)
             return
-        msg = await update.message.reply_text("⏳ Scanning joined groups + opt-in users...", reply_markup=MENU)
+        msg = await update.message.reply_text("⏳ Scanning joined groups + opt-in users...")
         out = []
         total_groups = 0
         total_users = 0
@@ -660,7 +696,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 if client:
                     await client.disconnect()
-        await msg.edit_text("🔄 <b>SCAN COMPLETE</b>\n\n" + "\n".join(map(esc, out)) + f"\n\n👥 Groups: <b>{total_groups}</b>\n👤 Opt-in users: <b>{total_users}</b>", parse_mode=ParseMode.HTML)
+        scan_text = (
+            "🔄 <b>SCAN COMPLETE</b>\n\n"
+            + "\n".join(map(esc, out))
+            + f"\n\n👥 Groups: <b>{total_groups}</b>\n👤 Opt-in users: <b>{total_users}</b>"
+        )
+        try:
+            await msg.edit_text(scan_text, parse_mode=ParseMode.HTML)
+        except BadRequest as e:
+            log.warning("Scan status message could not be edited: %s", type(e).__name__)
+            await update.message.reply_text(scan_text, parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "▶️ Start Promo":
         if promo_task and not promo_task.done():
