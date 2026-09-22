@@ -94,7 +94,19 @@ MENU = ReplyKeyboardMarkup(
         ["⏱ Interval", "🔄 Rescan Targets"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["📊 Live Stats", "📨 DM Broadcast"],
+        ["💬 Auto Reply"],
         ["🗑 Remove Session"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+AUTO_REPLY_MENU = ReplyKeyboardMarkup(
+    [
+        ["✏️ Account Reply", "✏️ Control Bot Reply"],
+        ["👁 Reply Preview", "🔄 Use Saved Post"],
+        ["🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"],
+        ["⏱ Reply Cooldown", "⬅️ Back"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -128,6 +140,36 @@ ACCOUNT_DM_AUTO_REPLY_TEXT = os.getenv(
     "👋 Hi! Thanks for messaging. We will get back to you soon."
 ).replace("\\n", "\n")
 DM_AUTO_REPLY_USE_SAVED_POST = os.getenv("DM_AUTO_REPLY_USE_SAVED_POST", "false").lower() in {"true", "1", "yes", "on"}
+async def reply_setting(key: str, env_default: str) -> str:
+    return await db.get_setting(key, env_default)
+
+
+async def reply_enabled(key: str, default: bool) -> bool:
+    return (await reply_setting(key, "true" if default else "false")).lower() in {"true", "1", "yes", "on"}
+
+
+async def reply_cooldown() -> int:
+    try:
+        return max(60, int(await reply_setting("dm_reply_cooldown_seconds", str(DM_REPLY_COOLDOWN_SECONDS))))
+    except (ValueError, TypeError):
+        return DM_REPLY_COOLDOWN_SECONDS
+
+
+async def reply_panel_text() -> str:
+    acc = await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED)
+    bot = await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED)
+    saved_post = await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST)
+    cooldown = await reply_cooldown()
+    return (
+        "💬 <b>AUTO REPLY SETTINGS</b>\n\n"
+        f"👤 Connected real IDs: <b>{'ON' if acc else 'OFF'}</b>\n"
+        f"🤖 Control bot: <b>{'ON' if bot else 'OFF'}</b>\n"
+        f"📝 Real-ID reply mode: <b>{'Saved promo post' if saved_post else 'Custom text'}</b>\n"
+        f"⏱ Cooldown: <b>{cooldown // 60} min</b>\n\n"
+        "Choose a button to edit. Changes apply without restart."
+    )
+
+
 _account_dm_clients: dict[str, TelegramClient] = {}
 _account_reply_timestamps: dict[tuple[str, int], float] = {}
 _bot_reply_timestamps: dict[int, float] = {}
@@ -566,7 +608,7 @@ async def scheduler(app: Application):
 
 async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages sent directly to the *admin control bot*."""
-    if not DM_AUTO_REPLY_ENABLED or not update.message or not update.effective_user:
+    if not await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED) or not update.message or not update.effective_user:
         return
     if update.effective_user.id == ADMIN_ID or update.effective_user.is_bot:
         return
@@ -574,12 +616,13 @@ async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     now = time.monotonic()
     uid = update.effective_user.id
-    if now - _bot_reply_timestamps.get(uid, -1e20) < DM_REPLY_COOLDOWN_SECONDS:
+    if now - _bot_reply_timestamps.get(uid, -1e20) < await reply_cooldown():
         return
     # Prevent duplicate replies to consecutive incoming media/text messages.
     _bot_reply_timestamps[uid] = now
     try:
-        await update.message.reply_text(DM_AUTO_REPLY_TEXT, disable_web_page_preview=True)
+        message = await reply_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
+        await update.message.reply_text(message, disable_web_page_preview=True)
     except Exception as e:
         log.warning("Control bot auto-reply failed: %s", type(e).__name__)
 
@@ -594,16 +637,17 @@ def account_reply_handler(session_key: str):
             return
         key = (session_key, int(event.sender_id))
         now = time.monotonic()
-        if now - _account_reply_timestamps.get(key, -1e20) < DM_REPLY_COOLDOWN_SECONDS:
+        if now - _account_reply_timestamps.get(key, -1e20) < await reply_cooldown():
             return
         _account_reply_timestamps[key] = now
         try:
-            if DM_AUTO_REPLY_USE_SAVED_POST:
+            if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
                 post = await db.get_post()
                 if post:
                     await send_saved_post(event.client, event.input_sender, post)
                     return
-            await event.reply(ACCOUNT_DM_AUTO_REPLY_TEXT, link_preview=False)
+            message = await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
+            await event.reply(message, link_preview=False)
         except errors.FloodWaitError as e:
             log.warning("DM auto-reply paused for session %s: FloodWait %ss", session_key, e.seconds)
             # Do not bypass Telegram's server limits or flood the same sender later.
@@ -616,8 +660,11 @@ async def account_auto_reply_service():
     """Maintain event listeners for all enabled account sessions, without dialog scans."""
     try:
         while True:
-            if not ACCOUNT_DM_AUTO_REPLY_ENABLED:
-                await asyncio.sleep(60)
+            if not await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED):
+                clients = list(_account_dm_clients.values())
+                _account_dm_clients.clear()
+                await asyncio.gather(*(c.disconnect() for c in clients), return_exceptions=True)
+                await asyncio.sleep(10)
                 continue
             rows = await session_store.get_sessions(enabled_only=True)
             enabled = {str(row["id"]): row for row in rows}
@@ -642,7 +689,7 @@ async def account_auto_reply_service():
                     log.warning("Account DM listener unavailable for %s: %s", row.get("label", sid), type(e).__name__)
                     if client:
                         await client.disconnect()
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
     except asyncio.CancelledError:
         raise
     finally:
@@ -699,14 +746,85 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("post_saved_message_id", None) == update.message.message_id:
         return
 
-    # Conversation states first
+    # Auto-reply submenu: always process Back before text input.
     current = state.get(uid)
-
     if text == "⬅️ Back":
         state.pop(uid, None)
         await cleanup_login_flow(uid)
         await update.message.reply_text("Main menu.", reply_markup=MENU)
         return
+
+    if current in {"await_account_reply", "await_control_reply"}:
+        if text.casefold() in {"cancel", "/cancel", "❌ cancel"}:
+            state.pop(uid, None)
+            await update.message.reply_text("Cancelled.", reply_markup=AUTO_REPLY_MENU)
+            return
+        if not text.strip() or len(text) > 4000:
+            await update.message.reply_text("Send a text reply of 1–4000 characters, or Back to cancel.", reply_markup=AUTO_REPLY_MENU)
+            return
+        key = "account_dm_text" if current == "await_account_reply" else "control_bot_dm_text"
+        await db.set_setting(key, text)
+        if current == "await_account_reply":
+            # Explicit text save switches off saved-post mode to avoid confusion.
+            await db.set_setting("dm_use_saved_post", "false")
+        state.pop(uid, None)
+        await update.message.reply_text("✅ Auto-reply saved. New incoming DMs will use it.\n\n" + await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+
+    if current == "await_reply_cooldown":
+        try:
+            minutes = int(text)
+            if not 1 <= minutes <= 1440:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Enter whole minutes (1–1440), or Back.", reply_markup=AUTO_REPLY_MENU)
+            return
+        await db.set_setting("dm_reply_cooldown_seconds", str(minutes * 60))
+        state.pop(uid, None)
+        await update.message.reply_text("✅ Cooldown updated.\n\n" + await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+
+    if text == "💬 Auto Reply":
+        state.pop(uid, None)
+        await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "✏️ Account Reply":
+        state[uid] = "await_account_reply"
+        await update.message.reply_text("Send the auto-reply text for connected real IDs. It will be saved when received. Press Back to cancel.", reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "✏️ Control Bot Reply":
+        state[uid] = "await_control_reply"
+        await update.message.reply_text("Send the auto-reply text for people DMing this control bot. Press Back to cancel.", reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "👁 Reply Preview":
+        a = await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
+        b = await reply_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
+        await update.message.reply_text(
+            "👁 <b>REPLY PREVIEW</b>\n\n👤 <b>Real IDs:</b>\n<pre>" + esc(a) +
+            "</pre>\n🤖 <b>Control bot:</b>\n<pre>" + esc(b) + "</pre>",
+            parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU,
+        )
+        return
+    if text == "🔄 Use Saved Post":
+        old = await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST)
+        if not old and not await db.get_post():
+            await update.message.reply_text("❌ Save a promotion post first.", reply_markup=AUTO_REPLY_MENU)
+            return
+        await db.set_setting("dm_use_saved_post", "false" if old else "true")
+        await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+    if text in {"🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"}:
+        key, default = (("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED) if text == "🟢 Toggle Account Reply" else ("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED))
+        old = await reply_enabled(key, default)
+        await db.set_setting(key, "false" if old else "true")
+        await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "⏱ Reply Cooldown":
+        state[uid] = "await_reply_cooldown"
+        await update.message.reply_text("Send cooldown in minutes (1–1440).", reply_markup=AUTO_REPLY_MENU)
+        return
+
+    # Other conversation states follow.
 
     if current == "choose_add_method":
         if text == "🔑 Session String":

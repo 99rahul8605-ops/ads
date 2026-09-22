@@ -129,3 +129,8 @@ Live stats show group and private-user totals separately.
 - Defaults: 5-minute cooldown per sender and session, configurable via `DM_REPLY_COOLDOWN_SECONDS`; both services may be turned off individually. Bot accounts and group messages are ignored. Added sessions activate within one minute; removed sessions stop within one minute.
 - Session listener does not rescan dialogs. The existing scheduled group broadcast and manual DM broadcast are unchanged.
 - Do not run multiple bot instances simultaneously against the same Telegram bot token, and safeguard `.env` and stored sessions.
+
+
+## Admin menu: Auto Reply
+
+Send `/start` then press **💬 Auto Reply**. Choose **✏️ Account Reply** for connected real IDs or **✏️ Control Bot Reply** for the control bot, then send the message. Settings persist in SQLite (`DB_PATH`) and update on new DMs without restarting. **👁 Reply Preview**, **🔄 Use Saved Post**, ON/OFF toggles, and cooldown are also available. Existing `.env` values are only defaults. Keep `promo.db` when migrating servers, or migrate this settings file alongside MongoDB sessions.
