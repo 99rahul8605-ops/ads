@@ -121,3 +121,11 @@ Live stats show group and private-user totals separately.
 - Default automatic cache refresh is 6 hours (`TARGET_CACHE_TTL_SECONDS=21600`).
 - Sessions broadcast in parallel; targets inside one session are sent sequentially with `GROUP_DELAY_SECONDS`.
 - Telegram FloodWait is never bypassed; only the affected session worker sleeps for the required time.
+
+## Incoming DM auto reply (Ads Promotion Bot)
+
+- When a person privately messages the **control bot**, it replies with `DM_AUTO_REPLY_TEXT`; admin actions and menu commands are unaffected.
+- When a person privately messages any **connected real account**, a background Telethon listener replies with `ACCOUNT_DM_AUTO_REPLY_TEXT`. Set `DM_AUTO_REPLY_USE_SAVED_POST=true` to reply with the saved promo post instead. Only inbound private messages trigger this feature; it does not proactively start conversations.
+- Defaults: 5-minute cooldown per sender and session, configurable via `DM_REPLY_COOLDOWN_SECONDS`; both services may be turned off individually. Bot accounts and group messages are ignored. Added sessions activate within one minute; removed sessions stop within one minute.
+- Session listener does not rescan dialogs. The existing scheduled group broadcast and manual DM broadcast are unchanged.
+- Do not run multiple bot instances simultaneously against the same Telegram bot token, and safeguard `.env` and stored sessions.

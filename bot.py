@@ -18,7 +18,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telethon import TelegramClient, errors, types
+from telethon import TelegramClient, errors, types, events
 from telethon.sessions import StringSession
 
 from database import Database, MongoSessionStore
@@ -114,6 +114,24 @@ login_flows: dict[int, dict] = {}
 # Cached InputPeer objects avoid a fresh GetDialogsRequest on every promotion round.
 target_cache: dict[str, dict] = {}
 TARGET_CACHE_TTL = max(300, int(os.getenv("TARGET_CACHE_TTL_SECONDS", "21600")))
+
+# Direct replies only to people who initiate a private conversation.
+DM_AUTO_REPLY_ENABLED = os.getenv("DM_AUTO_REPLY_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
+ACCOUNT_DM_AUTO_REPLY_ENABLED = os.getenv("ACCOUNT_DM_AUTO_REPLY_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
+DM_REPLY_COOLDOWN_SECONDS = max(60, int(os.getenv("DM_REPLY_COOLDOWN_SECONDS", "300")))
+DM_AUTO_REPLY_TEXT = os.getenv(
+    "DM_AUTO_REPLY_TEXT",
+    "👋 Hi! Thanks for reaching out. Your message has been received. We will reply when available."
+).replace("\\n", "\n")
+ACCOUNT_DM_AUTO_REPLY_TEXT = os.getenv(
+    "ACCOUNT_DM_AUTO_REPLY_TEXT",
+    "👋 Hi! Thanks for messaging. We will get back to you soon."
+).replace("\\n", "\n")
+DM_AUTO_REPLY_USE_SAVED_POST = os.getenv("DM_AUTO_REPLY_USE_SAVED_POST", "false").lower() in {"true", "1", "yes", "on"}
+_account_dm_clients: dict[str, TelegramClient] = {}
+_account_reply_timestamps: dict[tuple[str, int], float] = {}
+_bot_reply_timestamps: dict[int, float] = {}
+
 scan_locks: dict[str, asyncio.Lock] = {}
 
 @dataclass
@@ -546,9 +564,96 @@ async def scheduler(app: Application):
         stats.next_round_at = None
 
 
+async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages sent directly to the *admin control bot*."""
+    if not DM_AUTO_REPLY_ENABLED or not update.message or not update.effective_user:
+        return
+    if update.effective_user.id == ADMIN_ID or update.effective_user.is_bot:
+        return
+    if update.effective_chat.type != "private":
+        return
+    now = time.monotonic()
+    uid = update.effective_user.id
+    if now - _bot_reply_timestamps.get(uid, -1e20) < DM_REPLY_COOLDOWN_SECONDS:
+        return
+    # Prevent duplicate replies to consecutive incoming media/text messages.
+    _bot_reply_timestamps[uid] = now
+    try:
+        await update.message.reply_text(DM_AUTO_REPLY_TEXT, disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("Control bot auto-reply failed: %s", type(e).__name__)
+
+
+def account_reply_handler(session_key: str):
+    """Build a separate private-DM handler for each connected real account."""
+    async def on_dm(event):
+        if not event.is_private or event.out:
+            return
+        sender = await event.get_sender()
+        if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
+            return
+        key = (session_key, int(event.sender_id))
+        now = time.monotonic()
+        if now - _account_reply_timestamps.get(key, -1e20) < DM_REPLY_COOLDOWN_SECONDS:
+            return
+        _account_reply_timestamps[key] = now
+        try:
+            if DM_AUTO_REPLY_USE_SAVED_POST:
+                post = await db.get_post()
+                if post:
+                    await send_saved_post(event.client, event.input_sender, post)
+                    return
+            await event.reply(ACCOUNT_DM_AUTO_REPLY_TEXT, link_preview=False)
+        except errors.FloodWaitError as e:
+            log.warning("DM auto-reply paused for session %s: FloodWait %ss", session_key, e.seconds)
+            # Do not bypass Telegram's server limits or flood the same sender later.
+        except Exception as e:
+            log.warning("Account DM auto-reply failed session=%s: %s", session_key, type(e).__name__)
+    return on_dm
+
+
+async def account_auto_reply_service():
+    """Maintain event listeners for all enabled account sessions, without dialog scans."""
+    try:
+        while True:
+            if not ACCOUNT_DM_AUTO_REPLY_ENABLED:
+                await asyncio.sleep(60)
+                continue
+            rows = await session_store.get_sessions(enabled_only=True)
+            enabled = {str(row["id"]): row for row in rows}
+            for sid in list(_account_dm_clients):
+                client = _account_dm_clients[sid]
+                if sid not in enabled or not client.is_connected():
+                    _account_dm_clients.pop(sid, None)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+            for sid, row in enabled.items():
+                if sid in _account_dm_clients:
+                    continue
+                client = None
+                try:
+                    client = await make_client(decrypt_session(row["session_enc"]))
+                    client.add_event_handler(account_reply_handler(sid), events.NewMessage(incoming=True))
+                    _account_dm_clients[sid] = client
+                    log.info("Account DM auto-reply active for %s", row["label"])
+                except Exception as e:
+                    log.warning("Account DM listener unavailable for %s: %s", row.get("label", sid), type(e).__name__)
+                    if client:
+                        await client.disconnect()
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        clients = list(_account_dm_clients.values())
+        _account_dm_clients.clear()
+        await asyncio.gather(*(client.disconnect() for client in clients), return_exceptions=True)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
-        return
+        return await bot_dm_auto_reply(update, context)
     await update.message.reply_text(
         "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are cached so every promo round does not rescan dialogs. Recurring scheduler targets joined groups only. Use 📨 DM Broadcast for a one-time send to existing private dialogs.",
         parse_mode=ParseMode.HTML,
@@ -941,6 +1046,17 @@ async def post_init(app: Application):
     await session_store.init()
     if await db.get_setting("interval_minutes") is None:
         await db.set_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
+    app.bot_data["dm_listener_task"] = asyncio.create_task(account_auto_reply_service(), name="account_dm_auto_reply")
+
+
+async def post_shutdown(app: Application):
+    task = app.bot_data.pop("dm_listener_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -948,12 +1064,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start))
     # Save-post handler must run before the generic text/menu handler.
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION), save_post_message), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_post_message), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu), group=1)
+    # A stranger messaging the control bot receives a cooldown-limited response.
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, bot_dm_auto_reply), group=2)
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
