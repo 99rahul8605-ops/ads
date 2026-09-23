@@ -20,11 +20,20 @@ CREATE TABLE IF NOT EXISTS promo_post (
     media_type TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS promo_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    html_text TEXT,
+    media_path TEXT,
+    media_type TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
 class Database:
-    """SQLite store for lightweight local bot settings and the saved promo post."""
+    """SQLite store for settings and a library of promotion posts."""
 
     def __init__(self, path: str):
         self.path = path
@@ -33,6 +42,18 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SQLITE_SCHEMA)
+            # One-time migration; deleting every post must not restore the legacy post.
+            cur = await db.execute("SELECT value FROM settings WHERE key='posts_migrated_v1'")
+            if not await cur.fetchone():
+                await db.execute(
+                    """INSERT INTO promo_posts (kind,html_text,media_path,media_type,enabled)
+                       SELECT kind,html_text,media_path,media_type,1
+                       FROM promo_post WHERE id=1
+                         AND NOT EXISTS (SELECT 1 FROM promo_posts)"""
+                )
+                await db.execute(
+                    "INSERT INTO settings(key,value) VALUES('posts_migrated_v1','1')"
+                )
             await db.commit()
 
     async def set_setting(self, key: str, value: str):
@@ -49,27 +70,89 @@ class Database:
             row = await cur.fetchone()
             return row[0] if row else default
 
-    async def save_post(self, kind, html_text, media_path=None, media_type=None):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """INSERT INTO promo_post(id,kind,html_text,media_path,media_type)
-                   VALUES(1,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     kind=excluded.kind,
-                     html_text=excluded.html_text,
-                     media_path=excluded.media_path,
-                     media_type=excluded.media_type,
-                     updated_at=CURRENT_TIMESTAMP""",
+    async def add_post(self, kind, html_text, media_path=None, media_type=None):
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "INSERT INTO promo_posts(kind,html_text,media_path,media_type,enabled) VALUES(?,?,?,?,1)",
                 (kind, html_text, media_path, media_type),
             )
-            await db.commit()
+            await conn.commit()
+            return cur.lastrowid
 
-    async def get_post(self):
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM promo_post WHERE id=1")
+    async def list_posts(self, enabled_only=False):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            query = "SELECT * FROM promo_posts"
+            if enabled_only:
+                query += " WHERE enabled=1"
+            query += " ORDER BY id ASC"
+            cur = await conn.execute(query)
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def get_post_by_id(self, post_id):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def get_post(self):
+        """Compatibility helper for older callers; first enabled post."""
+        posts = await self.list_posts(enabled_only=True)
+        return posts[0] if posts else None
+
+    async def delete_post(self, post_id):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            await conn.execute("DELETE FROM promo_posts WHERE id=?", (post_id,))
+            await conn.commit()
+            return dict(row)
+
+    async def toggle_post(self, post_id):
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            new_enabled = 0 if row["enabled"] else 1
+            await conn.execute("UPDATE promo_posts SET enabled=? WHERE id=?", (new_enabled, post_id))
+            await conn.commit()
+            return bool(new_enabled)
+
+    async def next_reply_post(self, mode="rotate"):
+        """Pick an enabled post for an incoming opted-in DM auto-reply.
+
+        Persist the rotation counter atomically, including through bot restarts.
+        """
+        import random
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            if mode == "rotate":
+                await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute("SELECT * FROM promo_posts WHERE enabled=1 ORDER BY id")
+            posts = [dict(row) for row in await cur.fetchall()]
+            if not posts:
+                if mode == "rotate":
+                    await conn.rollback()
+                return None
+            if mode == "random":
+                return random.choice(posts)
+            cur = await conn.execute("SELECT value FROM settings WHERE key='reply_post_cursor'")
+            row = await cur.fetchone()
+            cursor = int(row[0]) if row else 0
+            chosen = posts[cursor % len(posts)]
+            await conn.execute(
+                "INSERT INTO settings(key,value) VALUES('reply_post_cursor',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(cursor + 1),),
+            )
+            await conn.commit()
+            return chosen
 
 
 class MongoSessionStore:

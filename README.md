@@ -5,7 +5,7 @@ Private admin bot controlling one or more Telethon user sessions through a persi
 ## Storage
 
 - **MongoDB:** encrypted Telethon StringSessions + session account metadata
-- **SQLite:** lightweight bot settings + saved promo post metadata
+- **SQLite:** lightweight bot settings + multiple saved promo posts
 - **Local media folder:** saved promo media files
 
 StringSessions are encrypted with Fernet **before** MongoDB receives them. Keep `FERNET_KEY` private; MongoDB alone cannot decrypt a stored session without that key.
@@ -18,7 +18,7 @@ StringSessions are encrypted with Fernet **before** MongoDB receives them. Keep 
 - Telegram 2FA password flow supported when enabled
 - Sessions encrypted with Fernet and stored in MongoDB
 - Automatic joined group/supergroup scanning
-- Save one promo post: text/photo/video/document/animation
+- Save multiple promo posts: text/photo/video/document/animation
 - Configurable repeat interval
 - Group-to-group delay
 - Start/stop scheduler
@@ -91,8 +91,8 @@ Re-adding the same Telegram account updates its stored encrypted session instead
   - Session String: paste an existing Telethon StringSession
   - Login with Phone: phone number → Telegram OTP → 2FA password if enabled → generated StringSession is encrypted and saved automatically
 - `👤 Sessions` — list MongoDB-backed sessions
-- `📝 Save Post` — save promotion post
-- `👁 View Post` — inspect saved post
+- `📝 Save Post` — add a new promotion post (never overwrites existing posts)
+- `📚 Manage Posts` — list/preview/enable/disable/delete posts; select Rotate or Random
 - `⏱ Interval` — repeat interval in minutes
 - `🔄 Rescan Groups` — count current joined groups
 - `▶️ Start Promo` / `⏹ Stop Promo`
@@ -134,3 +134,48 @@ Live stats show group and private-user totals separately.
 ## Admin menu: Auto Reply
 
 Send `/start` then press **💬 Auto Reply**. Choose **✏️ Account Reply** for connected real IDs or **✏️ Control Bot Reply** for the control bot, then send the message. Settings persist in SQLite (`DB_PATH`) and update on new DMs without restarting. **👁 Reply Preview**, **🔄 Use Saved Post**, ON/OFF toggles, and cooldown are also available. Existing `.env` values are only defaults. Keep `promo.db` when migrating servers, or migrate this settings file alongside MongoDB sessions.
+
+
+## Multi-post rotation and random sending
+
+Open `/start` → **📝 Save Post** to add each text/photo/video/document/animation post.
+You can add multiple posts; previous posts are not overwritten.
+
+Open **📚 Manage Posts** to access:
+
+- **📋 List Posts:** see all post IDs, active/paused states, and short previews.
+- **👁 Preview Post:** send the ID to preview the full saved text or media.
+- **🔘 Toggle Post:** send the ID to enable/disable a post without deleting it.
+- **🗑 Delete Post:** send the ID to permanently remove it and its locally stored media (only when broadcasts are stopped).
+- **🔀 Sending Mode:** choose **🔄 Rotate** or **🎲 Random**. The mode is saved in `promo.db`.
+
+**Rotate (default):** consecutive targets get successive enabled posts, and the
+starting post advances on each scheduled round, so a given group gets a
+*different post on the next scheduled round* when two or more are enabled.
+
+**Random:** each target gets a random enabled post; the recurring scheduler
+avoids sending the same post to a given session/group on consecutive rounds
+while this bot process remains running (when more than one post is enabled).
+
+Changes to enabled posts or mode are picked up at the **start of the next round**.
+The manual one-time DM broadcast and the connected-account saved-post auto-reply
+also use the selected post mode. Text auto-replies are unchanged when custom
+text mode is selected.
+
+Live Stats displays the active post count, sending mode, and latest selected
+post ID. FloodWait handling, target cache, parallel accounts, and per-account
+sequential target sending are retained.
+
+### Upgrading from the single-post Ads Bot
+
+Your existing `promo.db` is migrated automatically on first startup and the
+previous single saved post becomes the first item in the new post library.
+Existing MongoDB encrypted sessions are not modified.
+
+**Back up and keep all three when updating or moving servers:** `.env`, `promo.db`,
+and the `media/` directory. MongoDB remains your encrypted session store. Replace
+`bot.py`, `database.py`, and any updated dependencies, then restart the bot.
+Do **not** start a second instance with the same bot token.
+
+Use the scheduler only in groups that allow promotion; avoid repeated unwanted
+private messages. Telegram may enforce FloodWaits even at conservative delays.

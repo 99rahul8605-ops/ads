@@ -3,6 +3,7 @@ import html
 import logging
 import os
 import time
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -90,13 +91,30 @@ session_store = MongoSessionStore(MONGO_URI, MONGO_DB)
 MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Session", "👤 Sessions"],
-        ["📝 Save Post", "👁 View Post"],
+        ["📝 Save Post", "📚 Manage Posts"],
         ["⏱ Interval", "🔄 Rescan Targets"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["📊 Live Stats", "📨 DM Broadcast"],
         ["💬 Auto Reply"],
         ["🗑 Remove Session"],
     ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+POST_MENU = ReplyKeyboardMarkup(
+    [
+        ["📝 Save Post", "📋 List Posts"],
+        ["👁 Preview Post", "🔘 Toggle Post"],
+        ["🗑 Delete Post", "🔀 Sending Mode"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+POST_MODE_MENU = ReplyKeyboardMarkup(
+    [["🔄 Rotate", "🎲 Random"], ["⬅️ Back"]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -175,6 +193,8 @@ _account_reply_timestamps: dict[tuple[str, int], float] = {}
 _bot_reply_timestamps: dict[int, float] = {}
 
 scan_locks: dict[str, asyncio.Lock] = {}
+# Avoid back-to-back repeats per target in Random mode (while the process is running).
+last_random_post_by_target: dict[tuple[str, str], int] = {}
 
 @dataclass
 class RuntimeStats:
@@ -183,6 +203,9 @@ class RuntimeStats:
     started_at: float | None = None
     current_session: str = "-"
     current_group: str = "-"
+    current_post: str = "-"
+    post_mode: str = "rotate"
+    active_posts: int = 0
     total_groups: int = 0
     total_users: int = 0
     group_attempted: int = 0
@@ -216,6 +239,46 @@ def esc(s):
     return html.escape(str(s or ""))
 
 
+async def posts_summary():
+    posts = await db.list_posts()
+    mode = await db.get_setting("post_mode", "rotate")
+    if not posts:
+        return "📚 <b>POST LIBRARY</b>\n\nNo posts saved. Select 📝 Save Post to add one."
+    lines = [f"📚 <b>POST LIBRARY</b> ({len(posts)} total)",
+             f"Sending mode: <b>{esc(mode.title())}</b>", ""]
+    for post in posts:
+        preview = (post.get("html_text") or "(media only)")
+        preview = html.unescape(preview)
+        preview = preview.replace("\n", " ")
+        if len(preview) > 65:
+            preview = preview[:62] + "..."
+        status = "✅ ON" if post.get("enabled") else "⏸ OFF"
+        lines.append(f"<b>#{post['id']}</b> {status} · {esc(post['kind'])} · {esc(preview)}")
+    return "\n".join(lines)
+
+
+async def preview_saved_post(message, post):
+    label = f"👁 Preview #<b>{post['id']}</b> ({'enabled' if post.get('enabled') else 'disabled'})"
+    await message.reply_text(label, parse_mode=ParseMode.HTML, reply_markup=POST_MENU)
+    media_path = post.get("media_path")
+    caption = post.get("html_text") or None
+    if media_path:
+        if not Path(media_path).exists():
+            await message.reply_text("⚠️ Saved media file is missing from this server.", reply_markup=POST_MENU)
+            return
+        with open(media_path, "rb") as fh:
+            if post["kind"] == "photo":
+                await message.reply_photo(fh, caption=caption, parse_mode=ParseMode.HTML)
+            elif post["kind"] == "video":
+                await message.reply_video(fh, caption=caption, parse_mode=ParseMode.HTML)
+            elif post["kind"] == "animation":
+                await message.reply_animation(fh, caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                await message.reply_document(fh, caption=caption, parse_mode=ParseMode.HTML)
+    elif caption:
+        await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=POST_MENU)
+
+
 def fmt_duration(sec: float) -> str:
     sec = max(0, int(sec))
     h, rem = divmod(sec, 3600)
@@ -238,6 +301,8 @@ def stats_text() -> str:
         "📊 <b>LIVE PROMOTION STATS</b>\n\n"
         f"Status: {'🟢 Running' if stats.running else '🔴 Stopped'}\n"
         f"Round: <b>{stats.round_no}</b>\n"
+        f"📝 Active posts: <b>{stats.active_posts}</b> | Mode: <b>{esc(stats.post_mode.title())}</b>\n"
+        f"📮 Current post: <b>{esc(stats.current_post)}</b>\n"
         f"Overall: <b>{stats.attempted}/{total_targets}</b> ({pct:.1f}%)\n\n"
         "👥 <b>GROUPS</b>\n"
         f"Total: <b>{stats.total_groups}</b> | Tried: <b>{stats.group_attempted}</b>\n"
@@ -346,17 +411,31 @@ async def send_saved_post(client: TelegramClient, entity, post: dict):
         await client.send_message(entity, text, parse_mode="html", link_preview=False)
 
 
-async def _run_session_round(row, client, groups, users, post, progress_msg, edit_lock):
+def pick_post(posts: list[dict], mode: str, index: int, round_number: int = 1, previous_id=None):
+    if not posts:
+        raise RuntimeError("No active promotion posts")
+    if mode == "random":
+        choices = [post for post in posts if post["id"] != previous_id] if len(posts) > 1 else posts
+        return random.choice(choices or posts)
+    return posts[(index + round_number - 1) % len(posts)]
+
+
+async def _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock):
     """One session worker. Targets are sequential; session workers run in parallel."""
     targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
     last_edit = 0.0
     try:
-        for target_type, entity, name in targets:
+        for target_index, (target_type, entity, name) in enumerate(targets):
             if not stats.running:
                 return
             stats.current_session = row["label"]
             prefix = "👥" if target_type == "group" else "👤"
             stats.current_group = f"{prefix} {name}"
+            target_key = (str(row["id"]), str(entity))
+            post = pick_post(posts, mode, target_index, stats.round_no, last_random_post_by_target.get(target_key))
+            if mode == "random":
+                last_random_post_by_target[target_key] = post["id"]
+            stats.current_post = f"#{post['id']}"
             try:
                 await send_saved_post(client, entity, post)
                 stats.sent += 1
@@ -421,12 +500,17 @@ async def _run_session_round(row, client, groups, users, post, progress_msg, edi
 
 async def do_round(app: Application):
     sessions = await session_store.get_sessions(enabled_only=True)
-    post = await db.get_post()
+    posts = await db.list_posts(enabled_only=True)
+    mode = await db.get_setting("post_mode", "rotate")
+    if mode not in {"rotate", "random"}:
+        mode = "rotate"
     if not sessions:
         raise RuntimeError("No active sessions")
-    if not post:
-        raise RuntimeError("No promo post saved")
+    if not posts:
+        raise RuntimeError("No enabled promotion posts")
 
+    stats.post_mode = mode
+    stats.active_posts = len(posts)
     stats.round_no += 1
     stats.started_at = time.time()
     stats.group_attempted = stats.group_sent = stats.group_failed = stats.group_skipped = 0
@@ -467,7 +551,7 @@ async def do_round(app: Application):
 
     edit_lock = asyncio.Lock()
     # All sessions run simultaneously; each individual session sends sequentially.
-    await asyncio.gather(*(_run_session_round(row, client, groups, users, post, progress_msg, edit_lock)
+    await asyncio.gather(*(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock)
                            for row, client, groups, users in prepared))
 
     if progress_msg:
@@ -478,13 +562,18 @@ async def do_round(app: Application):
 
 
 async def run_one_time_dm_broadcast(app: Application):
-    """Send the saved post once to existing private DM dialogs, with per-session parallelism."""
+    """Manual one-time DM send to previously initiated private dialogs."""
     sessions = await session_store.get_sessions(enabled_only=True)
-    post = await db.get_post()
+    posts = await db.list_posts(enabled_only=True)
+    mode = await db.get_setting("post_mode", "rotate")
+    if mode not in {"rotate", "random"}:
+        mode = "rotate"
     if not sessions:
         raise RuntimeError("No active sessions")
-    if not post:
-        raise RuntimeError("No promo post saved")
+    if not posts:
+        raise RuntimeError("No enabled promotion posts")
+    stats.post_mode = mode
+    stats.active_posts = len(posts)
 
     stats.started_at = time.time()
     stats.current_group = "-"
@@ -527,9 +616,11 @@ async def run_one_time_dm_broadcast(app: Application):
     async def worker(row, client, users):
         last_edit = 0.0
         try:
-            for entity, name in users:
+            for target_index, (entity, name) in enumerate(users):
                 stats.current_session = row["label"]
                 stats.current_group = f"👤 {name}"
+                post = pick_post(posts, mode, target_index, stats.round_no)
+                stats.current_post = f"#{post['id']}"
                 try:
                     await send_saved_post(client, entity, post)
                     stats.sent += 1
@@ -575,6 +666,19 @@ async def run_one_time_dm_broadcast(app: Application):
         except Exception:
             pass
 
+
+
+async def dm_broadcast_runner(app: Application):
+    try:
+        await run_one_time_dm_broadcast(app)
+    except Exception as exc:
+        log.warning("Manual DM broadcast failed: %s", type(exc).__name__)
+        try:
+            await app.bot.send_message(ADMIN_ID, "⚠️ Manual DM broadcast stopped because of an error.")
+        except Exception:
+            pass
+    finally:
+        app.bot_data["dm_broadcast_running"] = False
 
 
 async def scheduler(app: Application):
@@ -642,7 +746,8 @@ def account_reply_handler(session_key: str):
         _account_reply_timestamps[key] = now
         try:
             if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
-                post = await db.get_post()
+                mode = await db.get_setting("post_mode", "rotate")
+                post = await db.next_reply_post(mode)
                 if post:
                     await send_saved_post(event.client, event.input_sender, post)
                     return
@@ -822,6 +927,70 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⏱ Reply Cooldown":
         state[uid] = "await_reply_cooldown"
         await update.message.reply_text("Send cooldown in minutes (1–1440).", reply_markup=AUTO_REPLY_MENU)
+        return
+
+    # Post-management flow. Back was already processed at the top of this function.
+    if current in {"await_preview_post_id", "await_toggle_post_id", "await_delete_post_id"}:
+        if text.casefold() in {"cancel", "/cancel", "❌ cancel"}:
+            state.pop(uid, None)
+            await update.message.reply_text("Cancelled.", reply_markup=POST_MENU)
+            return
+        try:
+            post_id = int(text.strip().lstrip("#"))
+        except ValueError:
+            await update.message.reply_text("Send the numeric post ID from 📋 List Posts, or press Back.", reply_markup=POST_MENU)
+            return
+        post = await db.get_post_by_id(post_id)
+        if not post:
+            await update.message.reply_text("❌ Post not found. Try an ID from the list.", reply_markup=POST_MENU)
+            return
+        if current == "await_preview_post_id":
+            state.pop(uid, None)
+            await preview_saved_post(update.message, post)
+            return
+        if stats.running or context.application.bot_data.get("dm_broadcast_running"):
+            await update.message.reply_text("⏹ Stop the ongoing broadcast before modifying posts.", reply_markup=POST_MENU)
+            state.pop(uid, None)
+            return
+        if current == "await_toggle_post_id":
+            if post["enabled"] and len(await db.list_posts(enabled_only=True)) <= 1:
+                await update.message.reply_text("❌ Keep at least one post enabled. Add another post before disabling this one.", reply_markup=POST_MENU)
+                state.pop(uid, None)
+                return
+            enabled = await db.toggle_post(post_id)
+            state.pop(uid, None)
+            await update.message.reply_text(f"✅ Post #{post_id} is now {'ON' if enabled else 'OFF'}.", reply_markup=POST_MENU)
+            return
+        if current == "await_delete_post_id":
+            deleted = await db.delete_post(post_id)
+            state.pop(uid, None)
+            if deleted and deleted.get("media_path"):
+                try:
+                    Path(deleted["media_path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            await update.message.reply_text(f"🗑 Post #{post_id} deleted.", reply_markup=POST_MENU)
+            return
+
+    if text in {"📚 Manage Posts", "👁 View Post"}:
+        state.pop(uid, None)
+        await update.message.reply_text(await posts_summary(), parse_mode=ParseMode.HTML, reply_markup=POST_MENU)
+        return
+    if text == "📋 List Posts":
+        await update.message.reply_text(await posts_summary(), parse_mode=ParseMode.HTML, reply_markup=POST_MENU)
+        return
+    if text in {"👁 Preview Post", "🔘 Toggle Post", "🗑 Delete Post"}:
+        state[uid] = {"👁 Preview Post":"await_preview_post_id", "🔘 Toggle Post":"await_toggle_post_id", "🗑 Delete Post":"await_delete_post_id"}[text]
+        await update.message.reply_text("Send the post ID from 📋 List Posts. Press Back to cancel.", reply_markup=POST_MENU)
+        return
+    if text == "🔀 Sending Mode":
+        current_mode = await db.get_setting("post_mode", "rotate")
+        await update.message.reply_text(f"Current mode: {current_mode.title()}\n\nChoose Rotate or Random.", reply_markup=POST_MODE_MENU)
+        return
+    if text in {"🔄 Rotate", "🎲 Random"}:
+        new_mode = "rotate" if text == "🔄 Rotate" else "random"
+        await db.set_setting("post_mode", new_mode)
+        await update.message.reply_text(f"✅ Sending mode: {new_mode.title()}. Changes apply on the next round.", reply_markup=POST_MENU)
         return
 
     # Other conversation states follow.
@@ -1007,17 +1176,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📝 Save Post":
         state[uid] = "await_post"
         await update.message.reply_text(
-            "Send the promotion post now.\n\nSupported: text, photo, video, document, animation. Formatting is preserved as HTML where Telegram exposes it.",
-            reply_markup=MENU,
+            "Send another promotion post now. Existing posts will not be replaced.\n\nSupported: text, photo, video, document, animation. Use Back to cancel.",
+            reply_markup=POST_MENU,
         )
-
-    elif text == "👁 View Post":
-        post = await db.get_post()
-        if not post:
-            await update.message.reply_text("No post saved yet.", reply_markup=MENU)
-            return
-        info = f"📝 Type: {post['kind']}\n📎 Media: {'Yes' if post.get('media_path') else 'No'}\n\n"
-        await update.message.reply_text(info + (post.get("html_text") or "(no caption)"), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "⏱ Interval":
         current_interval = await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
@@ -1061,8 +1222,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(scan_text, parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "▶️ Start Promo":
-        if promo_task and not promo_task.done():
-            await update.message.reply_text("🟢 Promotion is already running.", reply_markup=MENU)
+        if (promo_task and not promo_task.done()) or context.application.bot_data.get("dm_broadcast_running"):
+            await update.message.reply_text("🟢 A broadcast is already running.", reply_markup=MENU)
             return
         if not await db.get_post():
             await update.message.reply_text("❌ Save a promotion post first.", reply_markup=MENU)
@@ -1086,6 +1247,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏹ Promotion stopped.", reply_markup=MENU)
 
     elif text == "📨 DM Broadcast":
+        if context.application.bot_data.get("dm_broadcast_running"):
+            await update.message.reply_text("🟢 Manual DM broadcast is already running.", reply_markup=MENU)
+            return
         if stats.running:
             await update.message.reply_text("⏹ Stop the recurring group promotion before running a one-time DM broadcast.", reply_markup=MENU)
             return
@@ -1096,9 +1260,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
         await update.message.reply_text("📨 One-time broadcast to existing private DM dialogs started. Use 📊 Live Stats for progress.", reply_markup=MENU)
-        asyncio.create_task(run_one_time_dm_broadcast(context.application), name="one_time_dm_broadcast")
+        context.application.bot_data["dm_broadcast_running"] = True
+        asyncio.create_task(dm_broadcast_runner(context.application), name="one_time_dm_broadcast")
 
     elif text == "📊 Live Stats":
+        stats.active_posts = len(await db.list_posts(enabled_only=True))
+        stats.post_mode = await db.get_setting("post_mode", "rotate")
         await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     else:
@@ -1111,8 +1278,10 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if state.get(uid) != "await_post":
         return
-    state.pop(uid, None)
     m = update.message
+    if m.text in {"⬅️ Back", "❌ Cancel"}:
+        state.pop(uid, None)
+        return
 
     html_text = m.text_html or m.caption_html or ""
     media_path = None
@@ -1123,38 +1292,33 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m.photo:
             kind = media_type = "photo"
             tgfile = await m.photo[-1].get_file()
-            media_path = str(MEDIA_DIR / f"promo_{m.message_id}.jpg")
+            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}.jpg")
             await tgfile.download_to_drive(media_path)
         elif m.video:
             kind = media_type = "video"
             tgfile = await m.video.get_file()
             suffix = Path(m.video.file_name or "video.mp4").suffix or ".mp4"
-            media_path = str(MEDIA_DIR / f"promo_{m.message_id}{suffix}")
+            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
             await tgfile.download_to_drive(media_path)
         elif m.document:
             kind = media_type = "document"
             tgfile = await m.document.get_file()
             suffix = Path(m.document.file_name or "file.bin").suffix or ".bin"
-            media_path = str(MEDIA_DIR / f"promo_{m.message_id}{suffix}")
+            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
             await tgfile.download_to_drive(media_path)
         elif m.animation:
             kind = media_type = "animation"
             tgfile = await m.animation.get_file()
-            media_path = str(MEDIA_DIR / f"promo_{m.message_id}.mp4")
+            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}.mp4")
             await tgfile.download_to_drive(media_path)
         elif not m.text:
             await m.reply_text("❌ Unsupported post type. Send text/photo/video/document/animation.", reply_markup=MENU)
             return
 
-        old = await db.get_post()
-        await db.save_post(kind, html_text, media_path, media_type)
-        if old and old.get("media_path") and old["media_path"] != media_path:
-            try:
-                Path(old["media_path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
+        post_id = await db.add_post(kind, html_text, media_path, media_type)
+        state.pop(uid, None)
         context.user_data["post_saved_message_id"] = m.message_id
-        await m.reply_text("✅ Promotion post saved.", reply_markup=MENU)
+        await m.reply_text(f"✅ Post #{post_id} added. All existing posts are retained.\n\nSelect 🔀 Sending Mode to choose Rotate or Random.", reply_markup=POST_MENU)
     except Exception as e:
         await m.reply_text(f"❌ Could not save post:\n{type(e).__name__}: {e}", reply_markup=MENU)
 
