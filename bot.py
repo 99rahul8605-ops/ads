@@ -23,6 +23,7 @@ from telethon import TelegramClient, errors, types, events
 from telethon.sessions import StringSession
 
 from database import Database, MongoSessionStore
+from pacing import AccountPacer
 
 load_dotenv()
 
@@ -35,7 +36,10 @@ MONGO_URI = os.environ["MONGO_URI"]
 MONGO_DB = os.getenv("MONGO_DB", "promo_bot")
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
 DEFAULT_INTERVAL_MINUTES = int(os.getenv("DEFAULT_INTERVAL_MINUTES", "60"))
-GROUP_DELAY_SECONDS = max(3, int(os.getenv("GROUP_DELAY_SECONDS", "8")))
+GROUP_DELAY_SECONDS = max(15, int(os.getenv("GROUP_DELAY_SECONDS", "30")))
+DM_BROADCAST_DELAY_SECONDS = max(30, int(os.getenv("DM_BROADCAST_DELAY_SECONDS", "60")))
+DM_REPLY_SEND_GAP_SECONDS = max(2, int(os.getenv("DM_REPLY_SEND_GAP_SECONDS", "5")))
+RESTRICTION_PAUSE_HOURS = max(24, int(os.getenv("RESTRICTION_PAUSE_HOURS", "24")))
 FERNET_KEY = os.environ["FERNET_KEY"].encode()
 fernet = Fernet(FERNET_KEY)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,6 +89,7 @@ def configure_logging():
 configure_logging()
 log = logging.getLogger("promo-bot")
 
+pacer = AccountPacer()
 db = Database(DB_PATH)
 session_store = MongoSessionStore(MONGO_URI, MONGO_DB)
 
@@ -92,9 +97,10 @@ MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Session", "👤 Sessions"],
         ["📝 Save Post", "📚 Manage Posts"],
-        ["⏱ Interval", "🔄 Rescan Targets"],
+        ["⏱ Interval", "⏳ Group Delay"],
+        ["🔄 Rescan Targets", "📊 Live Stats"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
-        ["📊 Live Stats", "📨 DM Broadcast"],
+        ["📨 DM Broadcast"],
         ["💬 Auto Reply"],
         ["🗑 Remove Session"],
     ],
@@ -124,7 +130,8 @@ AUTO_REPLY_MENU = ReplyKeyboardMarkup(
         ["✏️ Account Reply", "✏️ Control Bot Reply"],
         ["👁 Reply Preview", "🔄 Use Saved Post"],
         ["🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"],
-        ["⏱ Reply Cooldown", "⬅️ Back"],
+        ["⏱ Reply Cooldown", "📡 Reply Status"],
+        ["⬅️ Back"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -184,12 +191,20 @@ async def reply_panel_text() -> str:
         f"🤖 Control bot: <b>{'ON' if bot else 'OFF'}</b>\n"
         f"📝 Real-ID reply mode: <b>{'Saved promo post' if saved_post else 'Custom text'}</b>\n"
         f"⏱ Cooldown: <b>{cooldown // 60} min</b>\n\n"
+        f"📡 Real-ID listeners connected: <b>{sum(c.is_connected() for c in _account_dm_clients.values())}</b>\n"
+        f"✅ Account replies sent since restart: <b>{_reply_sent_counts['accounts']}</b>\n\n"
         "Choose a button to edit. Changes apply without restart."
     )
 
 
+# A single persistent Telethon connection per account is shared by group promotion,
+# manual DM broadcasts and incoming-DM handlers. Separate simultaneous clients using
+# the same StringSession can compete for updates, making auto-replies unreliable.
 _account_dm_clients: dict[str, TelegramClient] = {}
+_account_client_locks: dict[str, asyncio.Lock] = {}
 _account_reply_timestamps: dict[tuple[str, int], float] = {}
+_account_reply_pending: set[tuple[str, int]] = set()
+_reply_sent_counts = {"accounts": 0, "control_bot": 0, "failed": 0}
 _bot_reply_timestamps: dict[int, float] = {}
 
 scan_locks: dict[str, asyncio.Lock] = {}
@@ -221,6 +236,8 @@ class RuntimeStats:
     failed: int = 0
     skipped: int = 0
     flood_waits: int = 0
+    paused_sessions: int = 0
+    group_delay_seconds: int = GROUP_DELAY_SECONDS
     last_error: str = "-"
     next_round_at: float | None = None
     cached_group_count: dict = field(default_factory=dict)
@@ -310,7 +327,8 @@ def stats_text() -> str:
         "👤 <b>OPT-IN USERS</b>\n"
         f"Total: <b>{stats.total_users}</b> | Tried: <b>{stats.user_attempted}</b>\n"
         f"✅ {stats.user_sent}  ❌ {stats.user_failed}  ⏭ {stats.user_skipped}\n\n"
-        f"⏳ Flood waits: <b>{stats.flood_waits}</b>\n"
+        f"⏳ Flood waits: <b>{stats.flood_waits}</b> | Paused IDs: <b>{stats.paused_sessions}</b>\n"
+        f"⏳ Minimum group gap: <b>{stats.group_delay_seconds}s</b>\n"
         f"🔐 Session: <code>{esc(stats.current_session)}</code>\n"
         f"🎯 Current: {esc(stats.current_group)}\n"
         f"⏱ Elapsed: {elapsed}\n"
@@ -320,12 +338,48 @@ def stats_text() -> str:
 
 
 async def make_client(session_string: str) -> TelegramClient:
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH, flood_sleep_threshold=0)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
         raise RuntimeError("Session is not authorized")
     return client
+
+
+async def get_account_client(row: dict) -> TelegramClient:
+    """Get or create the one long-lived, event-enabled client for this account.
+
+    The per-account lock prevents both the listener service and a broadcast
+    starting simultaneously from opening duplicate sessions.
+    """
+    sid = str(row["id"])
+    lock = _account_client_locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        existing = _account_dm_clients.get(sid)
+        if existing and existing.is_connected():
+            return existing
+        if existing:
+            _account_dm_clients.pop(sid, None)
+            try:
+                await existing.disconnect()
+            except Exception:
+                pass
+        client = await make_client(decrypt_session(row["session_enc"]))
+        # Register on the SAME client that broadcasts will use. The handler
+        # checks its enabled setting on every incoming message.
+        client.add_event_handler(account_reply_handler(sid), events.NewMessage(incoming=True))
+        _account_dm_clients[sid] = client
+        log.info("Account DM listener ready for %s", row.get("label", sid))
+        return client
+
+
+async def close_account_client(sid: str):
+    sid = str(sid)
+    lock = _account_client_locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        client = _account_dm_clients.pop(sid, None)
+        if client:
+            await client.disconnect()
 
 
 def decrypt_session(value: str) -> str:
@@ -395,6 +449,50 @@ async def get_cached_targets(row: dict, client: TelegramClient, force: bool = Fa
         return groups, users, True
 
 
+async def get_group_delay() -> int:
+    """Per-session minimum gap between group sends, editable from the admin menu."""
+    try:
+        return min(600, max(15, int(await db.get_setting("group_delay_seconds", str(GROUP_DELAY_SECONDS)))))
+    except (ValueError, TypeError):
+        return GROUP_DELAY_SECONDS
+
+
+async def get_pause_remaining(session_id: str) -> int:
+    """Persisted in settings so restarting the bot never clears a FloodWait."""
+    try:
+        paused_until = float(await db.get_setting(f"account_pause:{session_id}", "0"))
+    except (ValueError, TypeError):
+        return 0
+    return max(0, int(paused_until - time.time() + 0.999))
+
+
+async def pause_account(session_id: str, seconds: float, reason: str):
+    seconds = max(1, int(seconds))
+    key = f"account_pause:{session_id}"
+    try:
+        old_until = float(await db.get_setting(key, "0"))
+    except (ValueError, TypeError):
+        old_until = 0
+    until = max(old_until, time.time() + seconds)
+    await db.set_setting(key, str(until))
+    await db.set_setting(f"account_pause_reason:{session_id}", reason)
+    log.warning("Session %s paused for %ss: %s", session_id, max(1, int(until-time.time())), reason)
+
+
+class AccountPausedError(Exception):
+    def __init__(self, remaining: int):
+        self.remaining = int(remaining)
+        super().__init__(f"Account cooling down ({self.remaining}s left)")
+
+
+async def guarded_account_send(session_id: str, operation):
+    """Re-check account restrictions at execution time, after any queue wait."""
+    remaining = await get_pause_remaining(session_id)
+    if remaining:
+        raise AccountPausedError(remaining)
+    return await operation()
+
+
 async def send_saved_post(client: TelegramClient, entity, post: dict):
     text = post.get("html_text") or ""
     media_path = post.get("media_path")
@@ -421,50 +519,78 @@ def pick_post(posts: list[dict], mode: str, index: int, round_number: int = 1, p
 
 
 async def _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock):
-    """One session worker. Targets are sequential; session workers run in parallel."""
+    """Independent account worker; sequential, paced group sends and no immediate flood retries."""
     targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
+    sid = str(row["id"])
     last_edit = 0.0
+    delay = stats.group_delay_seconds
     try:
         for target_index, (target_type, entity, name) in enumerate(targets):
             if not stats.running:
                 return
             stats.current_session = row["label"]
-            prefix = "👥" if target_type == "group" else "👤"
-            stats.current_group = f"{prefix} {name}"
-            target_key = (str(row["id"]), str(entity))
-            post = pick_post(posts, mode, target_index, stats.round_no, last_random_post_by_target.get(target_key))
+            stats.current_group = f"{'👥' if target_type == 'group' else '👤'} {name}"
+            target_key = (sid, str(entity))
+            post = pick_post(posts, mode, target_index, stats.round_no,
+                             last_random_post_by_target.get(target_key))
             if mode == "random":
                 last_random_post_by_target[target_key] = post["id"]
             stats.current_post = f"#{post['id']}"
+            stop_this_account = False
             try:
-                await send_saved_post(client, entity, post)
+                # A single pacing lock is shared with this account's incoming DM auto-reply.
+                await pacer.run(
+                    sid, delay if target_type == "group" else DM_BROADCAST_DELAY_SECONDS,
+                    lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)),
+                )
                 stats.sent += 1
                 if target_type == "group":
                     stats.group_sent += 1
                 else:
                     stats.user_sent += 1
+            except AccountPausedError as e:
+                stats.skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
+                stats.paused_sessions += 1
+                stats.last_error = f"{row['label']}: account cooling down ({e.remaining}s left)"
+                stop_this_account = True
+            except errors.SlowModeWaitError as e:
+                # Slow mode is a chat-level restriction; skip this chat for this round.
+                stats.skipped += 1
+                stats.group_skipped += 1
+                stats.last_error = f"{row['label']}: {name} has slow mode ({e.seconds}s)"
             except errors.FloodWaitError as e:
-                # Telegram's server-mandated wait is respected for only this session worker.
+                # Do not immediately retry the same target after FloodWait. Respect
+                # Telegram's stated cooldown, persist it, and stop this account's round.
                 stats.flood_waits += 1
-                stats.last_error = f"{row['label']}: FloodWait {e.seconds}s at {name}"
-                await asyncio.sleep(e.seconds)
-                if not stats.running:
-                    return
-                try:
-                    await send_saved_post(client, entity, post)
-                    stats.sent += 1
-                    if target_type == "group":
-                        stats.group_sent += 1
-                    else:
-                        stats.user_sent += 1
-                except Exception as retry_e:
-                    stats.failed += 1
-                    if target_type == "group":
-                        stats.group_failed += 1
-                    else:
-                        stats.user_failed += 1
-                    stats.last_error = f"{row['label']}: {type(retry_e).__name__}: {retry_e}"
-            except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError, errors.ChatAdminRequiredError):
+                stats.skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
+                wait = int(e.seconds) + delay
+                await pause_account(sid, wait, f"Telegram FloodWait ({e.seconds}s)")
+                stats.last_error = f"{row['label']}: FloodWait {e.seconds}s; account paused"
+                stats.paused_sessions += 1
+                stop_this_account = True
+            except errors.PeerFloodError:
+                # PeerFlood indicates an account-level anti-spam restriction.
+                # Delays cannot lift that restriction; pause this account.
+                await pause_account(sid, RESTRICTION_PAUSE_HOURS * 3600,
+                                    "Telegram account restriction (PeerFlood); review account status")
+                stats.skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
+                stats.last_error = f"{row['label']}: account restricted; sending paused"
+                stats.paused_sessions += 1
+                stop_this_account = True
+            except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError,
+                    errors.ChatAdminRequiredError):
                 stats.skipped += 1
                 if target_type == "group":
                     stats.group_skipped += 1
@@ -486,16 +612,20 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                     stats.user_attempted += 1
 
             now = time.time()
-            if progress_msg and now - last_edit >= 3:
+            if progress_msg and (now - last_edit >= 3 or stop_this_account):
                 async with edit_lock:
                     try:
                         await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
                 last_edit = now
-            await asyncio.sleep(GROUP_DELAY_SECONDS)
+            if stop_this_account:
+                break
+            # No explicit sleep here: AccountPacer enforces the minimum gap
+            # between completed sends, including interleaved DM auto-replies.
     finally:
-        await client.disconnect()
+        # Persistent shared client continues receiving DMs during and after the round.
+        pass
 
 
 async def do_round(app: Application):
@@ -519,22 +649,33 @@ async def do_round(app: Application):
     stats.total_groups = 0
     stats.total_users = 0
     stats.last_error = "-"
+    stats.paused_sessions = 0
+    stats.group_delay_seconds = await get_group_delay()
 
     prepared = []
     # Connect sessions concurrently. A target scan occurs only when cache is missing/stale.
     async def prepare(row):
         client = None
         try:
-            client = await make_client(decrypt_session(row["session_enc"]))
+            remaining = await get_pause_remaining(str(row["id"]))
+            if remaining:
+                return row, None, [], [], ("paused", remaining)
+            client = await get_account_client(row)
             groups, users, _ = await get_cached_targets(row, client, force=False)
             return row, client, groups, users, None
+        except errors.FloodWaitError as e:
+            await pause_account(str(row["id"]), e.seconds + stats.group_delay_seconds,
+                                f"Telegram FloodWait while scanning/connecting ({e.seconds}s)")
+            return row, None, [], [], ("paused", int(e.seconds))
         except Exception as e:
-            if client:
-                await client.disconnect()
             return row, None, [], [], e
 
     results = await asyncio.gather(*(prepare(row) for row in sessions))
     for row, client, groups, users, err in results:
+        if isinstance(err, tuple) and err[0] == "paused":
+            stats.paused_sessions += 1
+            stats.last_error = f"{row['label']}: account cooling down ({fmt_duration(err[1])} left)"
+            continue
         if err:
             stats.failed += 1
             stats.last_error = f"{row['label']}: {type(err).__name__}: {err}"
@@ -583,21 +724,32 @@ async def run_one_time_dm_broadcast(app: Application):
     stats.total_groups = 0
     stats.total_users = 0
     stats.last_error = "-"
+    stats.paused_sessions = 0
+    stats.group_delay_seconds = await get_group_delay()
 
     prepared = []
     async def prepare_dm(row):
         client = None
         try:
-            client = await make_client(decrypt_session(row["session_enc"]))
+            remaining = await get_pause_remaining(str(row["id"]))
+            if remaining:
+                return row, None, [], ("paused", remaining)
+            client = await get_account_client(row)
             users = await scan_existing_dm_users(client)
             return row, client, users, None
+        except errors.FloodWaitError as e:
+            await pause_account(str(row["id"]), e.seconds + DM_BROADCAST_DELAY_SECONDS,
+                                f"Telegram FloodWait while scanning DMs ({e.seconds}s)")
+            return row, None, [], ("paused", int(e.seconds))
         except Exception as e:
-            if client:
-                await client.disconnect()
             return row, None, [], e
 
     results = await asyncio.gather(*(prepare_dm(row) for row in sessions))
     for row, client, users, err in results:
+        if isinstance(err, tuple) and err[0] == "paused":
+            stats.paused_sessions += 1
+            stats.last_error = f"{row['label']}: account cooling down ({fmt_duration(err[1])} left)"
+            continue
         if err:
             stats.failed += 1
             stats.last_error = f"{row['label']}: {type(err).__name__}: {err}"
@@ -614,29 +766,48 @@ async def run_one_time_dm_broadcast(app: Application):
     edit_lock = asyncio.Lock()
 
     async def worker(row, client, users):
+        sid = str(row["id"])
         last_edit = 0.0
         try:
+            remaining = await get_pause_remaining(sid)
+            if remaining:
+                stats.paused_sessions += 1
+                stats.last_error = f"{row['label']}: paused for {fmt_duration(remaining)}"
+                return
             for target_index, (entity, name) in enumerate(users):
                 stats.current_session = row["label"]
                 stats.current_group = f"👤 {name}"
                 post = pick_post(posts, mode, target_index, stats.round_no)
                 stats.current_post = f"#{post['id']}"
+                stop_this_account = False
                 try:
-                    await send_saved_post(client, entity, post)
+                    await pacer.run(sid, DM_BROADCAST_DELAY_SECONDS,
+                                    lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)))
                     stats.sent += 1
                     stats.user_sent += 1
+                except AccountPausedError as e:
+                    stats.skipped += 1
+                    stats.user_skipped += 1
+                    stats.paused_sessions += 1
+                    stats.last_error = f"{row['label']}: account cooling down ({e.remaining}s left)"
+                    stop_this_account = True
                 except errors.FloodWaitError as e:
                     stats.flood_waits += 1
-                    stats.last_error = f"{row['label']}: FloodWait {e.seconds}s at {name}"
-                    await asyncio.sleep(e.seconds)
-                    try:
-                        await send_saved_post(client, entity, post)
-                        stats.sent += 1
-                        stats.user_sent += 1
-                    except Exception as retry_e:
-                        stats.failed += 1
-                        stats.user_failed += 1
-                        stats.last_error = f"{row['label']}: {type(retry_e).__name__}: {retry_e}"
+                    stats.skipped += 1
+                    stats.user_skipped += 1
+                    await pause_account(sid, e.seconds + DM_BROADCAST_DELAY_SECONDS,
+                                        f"Telegram FloodWait during manual DM ({e.seconds}s)")
+                    stats.last_error = f"{row['label']}: FloodWait {e.seconds}s; account paused"
+                    stats.paused_sessions += 1
+                    stop_this_account = True
+                except errors.PeerFloodError:
+                    await pause_account(sid, RESTRICTION_PAUSE_HOURS * 3600,
+                                        "Telegram account restriction (PeerFlood)")
+                    stats.skipped += 1
+                    stats.user_skipped += 1
+                    stats.paused_sessions += 1
+                    stats.last_error = f"{row['label']}: account restricted; manual DM stopped"
+                    stop_this_account = True
                 except Exception as e:
                     stats.failed += 1
                     stats.user_failed += 1
@@ -644,18 +815,20 @@ async def run_one_time_dm_broadcast(app: Application):
                 finally:
                     stats.attempted += 1
                     stats.user_attempted += 1
-
                 now = time.time()
-                if progress_msg and now - last_edit >= 3:
+                if progress_msg and (now - last_edit >= 3 or stop_this_account):
                     async with edit_lock:
                         try:
-                            await progress_msg.edit_text("📨 <b>DM BROADCAST</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+                            await progress_msg.edit_text("📨 <b>DM BROADCAST</b>\n\n" + stats_text(),
+                                                         parse_mode=ParseMode.HTML)
                         except Exception:
                             pass
                     last_edit = now
-                await asyncio.sleep(GROUP_DELAY_SECONDS)
+                if stop_this_account:
+                    break
         finally:
-            await client.disconnect()
+            # Keep listening for incoming DMs after the manual broadcast.
+            pass
 
     await asyncio.gather(*(worker(row, client, users) for row, client, users in prepared))
     stats.current_group = "-"
@@ -727,80 +900,104 @@ async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         message = await reply_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
         await update.message.reply_text(message, disable_web_page_preview=True)
+        _reply_sent_counts["control_bot"] += 1
     except Exception as e:
+        _reply_sent_counts["failed"] += 1
+        _bot_reply_timestamps.pop(uid, None)
         log.warning("Control bot auto-reply failed: %s", type(e).__name__)
 
 
 def account_reply_handler(session_key: str):
-    """Build a separate private-DM handler for each connected real account."""
+    """Incoming private DM handler, active even during long broadcast rounds."""
     async def on_dm(event):
         if not event.is_private or event.out:
+            return
+        if not await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED):
             return
         sender = await event.get_sender()
         if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
             return
         key = (session_key, int(event.sender_id))
         now = time.monotonic()
+        if key in _account_reply_pending:
+            return
         if now - _account_reply_timestamps.get(key, -1e20) < await reply_cooldown():
             return
-        _account_reply_timestamps[key] = now
+        if await get_pause_remaining(session_key):
+            # A Telegram FloodWait/PeerFlood applies to replies as well.
+            return
+        _account_reply_pending.add(key)
         try:
             if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
                 mode = await db.get_setting("post_mode", "rotate")
                 post = await db.next_reply_post(mode)
                 if post:
-                    await send_saved_post(event.client, event.input_sender, post)
+                    await pacer.run(
+                        session_key, DM_REPLY_SEND_GAP_SECONDS,
+                        lambda: guarded_account_send(session_key, lambda: send_saved_post(event.client, event.input_sender or sender, post)),
+                        priority=True,
+                    )
+                    _account_reply_timestamps[key] = time.monotonic()
+                    _reply_sent_counts["accounts"] += 1
                     return
             message = await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
-            await event.reply(message, link_preview=False)
+            await pacer.run(
+                session_key, DM_REPLY_SEND_GAP_SECONDS,
+                lambda: guarded_account_send(session_key, lambda: event.reply(message, link_preview=False)),
+                priority=True,
+            )
+            # A failed/delayed reply must not start a 5-minute cooldown.
+            _account_reply_timestamps[key] = time.monotonic()
+            _reply_sent_counts["accounts"] += 1
+        except AccountPausedError:
+            # Pause may begin while this reply waits behind a group message.
+            return
+        except errors.PeerFloodError:
+            await pause_account(session_key, RESTRICTION_PAUSE_HOURS * 3600,
+                                "Telegram account restriction (PeerFlood) during DM auto-reply")
         except errors.FloodWaitError as e:
+            await pause_account(session_key, e.seconds + GROUP_DELAY_SECONDS,
+                                f"Telegram FloodWait during DM auto-reply ({e.seconds}s)")
             log.warning("DM auto-reply paused for session %s: FloodWait %ss", session_key, e.seconds)
-            # Do not bypass Telegram's server limits or flood the same sender later.
         except Exception as e:
+            _reply_sent_counts["failed"] += 1
             log.warning("Account DM auto-reply failed session=%s: %s", session_key, type(e).__name__)
+        finally:
+            _account_reply_pending.discard(key)
     return on_dm
 
 
-async def account_auto_reply_service():
-    """Maintain event listeners for all enabled account sessions, without dialog scans."""
+async def account_auto_reply_service(app: Application):
+    """Keep one Telegram connection per enabled account, shared by all workloads."""
     try:
         while True:
-            if not await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED):
-                clients = list(_account_dm_clients.values())
-                _account_dm_clients.clear()
-                await asyncio.gather(*(c.disconnect() for c in clients), return_exceptions=True)
-                await asyncio.sleep(10)
-                continue
-            rows = await session_store.get_sessions(enabled_only=True)
-            enabled = {str(row["id"]): row for row in rows}
-            for sid in list(_account_dm_clients):
-                client = _account_dm_clients[sid]
-                if sid not in enabled or not client.is_connected():
-                    _account_dm_clients.pop(sid, None)
+            try:
+                rows = await session_store.get_sessions(enabled_only=True)
+                enabled = {str(row["id"]): row for row in rows}
+                for sid in list(_account_dm_clients):
+                    if sid not in enabled:
+                        # Do not interrupt an active broadcast; revoke afterward.
+                        if not stats.running and not app.bot_data.get("dm_broadcast_running"):
+                            await close_account_client(sid)
+                for sid, row in enabled.items():
                     try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-            for sid, row in enabled.items():
-                if sid in _account_dm_clients:
-                    continue
-                client = None
-                try:
-                    client = await make_client(decrypt_session(row["session_enc"]))
-                    client.add_event_handler(account_reply_handler(sid), events.NewMessage(incoming=True))
-                    _account_dm_clients[sid] = client
-                    log.info("Account DM auto-reply active for %s", row["label"])
-                except Exception as e:
-                    log.warning("Account DM listener unavailable for %s: %s", row.get("label", sid), type(e).__name__)
-                    if client:
-                        await client.disconnect()
+                        await get_account_client(row)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.warning("Account listener unavailable for %s: %s",
+                                    row.get("label", sid), type(e).__name__)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Account listener manager error: %s", type(e).__name__)
             await asyncio.sleep(10)
     except asyncio.CancelledError:
         raise
     finally:
-        clients = list(_account_dm_clients.values())
-        _account_dm_clients.clear()
-        await asyncio.gather(*(client.disconnect() for client in clients), return_exceptions=True)
+        # This manager is the sole owner of persistent account connections.
+        await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
+                             return_exceptions=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -923,6 +1120,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old = await reply_enabled(key, default)
         await db.set_setting(key, "false" if old else "true")
         await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "📡 Reply Status":
+        rows = await session_store.get_sessions(enabled_only=True)
+        online = {sid for sid, client in _account_dm_clients.items() if client.is_connected()}
+        account_enabled = await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED)
+        control_enabled = await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED)
+        await update.message.reply_text(
+            "📡 <b>AUTO-REPLY STATUS</b>\n\n"
+            f"👤 Account replies: <b>{'ON' if account_enabled else 'OFF'}</b>\n"
+            f"🤖 Control bot replies: <b>{'ON' if control_enabled else 'OFF'}</b>\n"
+            f"🔌 Connected accounts: <b>{len(online)}/{len(rows)}</b>\n"
+            f"⏳ DM replies queued: <b>{len(_account_reply_pending)}</b>\n"
+            f"✅ Account replies sent: <b>{_reply_sent_counts['accounts']}</b>\n"
+            f"✅ Control replies sent: <b>{_reply_sent_counts['control_bot']}</b>\n"
+            f"⚠️ Auto-reply errors: <b>{_reply_sent_counts['failed']}</b>\n\n"
+            "Queued replies follow the account's current group cooldown. "
+            "If an account is FloodWait/PeerFlood paused, replies pause too.",
+            parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU,
+        )
         return
     if text == "⏱ Reply Cooldown":
         state[uid] = "await_reply_cooldown"
@@ -1119,6 +1335,20 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
 
+    if current == "await_group_delay":
+        try:
+            seconds = int(text.strip())
+            if not 15 <= seconds <= 600:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Send a whole number of seconds (15–600), or press Back.", reply_markup=MENU)
+            return
+        await db.set_setting("group_delay_seconds", str(seconds))
+        stats.group_delay_seconds = seconds
+        state.pop(uid, None)
+        await update.message.reply_text(f"✅ Minimum group delay set to {seconds} seconds. Applies next round.", reply_markup=MENU)
+        return
+
     if current == "await_interval":
         state.pop(uid, None)
         try:
@@ -1180,6 +1410,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=POST_MENU,
         )
 
+    elif text == "⏳ Group Delay":
+        current_delay = await get_group_delay()
+        state[uid] = "await_group_delay"
+        await update.message.reply_text(
+            f"Current minimum delay: {current_delay} seconds between group sends on each ID.\n\n"
+            "Send a new value in seconds (15–600). Lower delay does not guarantee Telegram acceptance.",
+            reply_markup=MENU,
+        )
+
     elif text == "⏱ Interval":
         current_interval = await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
         state[uid] = "await_interval"
@@ -1200,7 +1439,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows:
             client = None
             try:
-                client = await make_client(decrypt_session(r["session_enc"]))
+                client = await get_account_client(r)
                 groups, users, _ = await get_cached_targets(r, client, force=True)
                 total_groups += len(groups)
                 total_users += len(users)
@@ -1208,8 +1447,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 out.append(f"❌ {r['label']}: {type(e).__name__}")
             finally:
-                if client:
-                    await client.disconnect()
+                # Managed client remains connected for the DM listener.
+                pass
         scan_text = (
             "🔄 <b>SCAN COMPLETE</b>\n\n"
             + "\n".join(map(esc, out))
@@ -1261,7 +1500,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text("📨 One-time broadcast to existing private DM dialogs started. Use 📊 Live Stats for progress.", reply_markup=MENU)
         context.application.bot_data["dm_broadcast_running"] = True
-        asyncio.create_task(dm_broadcast_runner(context.application), name="one_time_dm_broadcast")
+        context.application.bot_data["dm_broadcast_task"] = asyncio.create_task(
+            dm_broadcast_runner(context.application), name="one_time_dm_broadcast")
 
     elif text == "📊 Live Stats":
         stats.active_posts = len(await db.list_posts(enabled_only=True))
@@ -1328,10 +1568,21 @@ async def post_init(app: Application):
     await session_store.init()
     if await db.get_setting("interval_minutes") is None:
         await db.set_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
-    app.bot_data["dm_listener_task"] = asyncio.create_task(account_auto_reply_service(), name="account_dm_auto_reply")
+    if await db.get_setting("group_delay_seconds") is None:
+        await db.set_setting("group_delay_seconds", str(GROUP_DELAY_SECONDS))
+    stats.group_delay_seconds = await get_group_delay()
+    app.bot_data["dm_listener_task"] = asyncio.create_task(account_auto_reply_service(app), name="account_dm_auto_reply")
 
 
 async def post_shutdown(app: Application):
+    global promo_task
+    stats.running = False
+    outgoing = [promo_task, app.bot_data.pop("dm_broadcast_task", None)]
+    for job in outgoing:
+        if job and not job.done():
+            job.cancel()
+    await asyncio.gather(*(job for job in outgoing if job), return_exceptions=True)
+    promo_task = None
     task = app.bot_data.pop("dm_listener_task", None)
     if task:
         task.cancel()
@@ -1339,6 +1590,9 @@ async def post_shutdown(app: Application):
             await task
         except asyncio.CancelledError:
             pass
+    # Defensive cleanup for partial startup or a previously failed listener manager.
+    await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
+                         return_exceptions=True)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

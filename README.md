@@ -179,3 +179,39 @@ Do **not** start a second instance with the same bot token.
 
 Use the scheduler only in groups that allow promotion; avoid repeated unwanted
 private messages. Telegram may enforce FloodWaits even at conservative delays.
+
+
+## Conservative per-account pacing and Telegram limits
+
+- Menu: **⏳ Group Delay**. Default **30 seconds**, configurable from 15 to 600 seconds. This is the minimum gap between actual sends by each account.
+- Each ID has one outgoing pacing lane shared by its group sends and incoming DM auto-replies. Different account workers remain independent.
+- Manual one-time DM broadcasts have their own minimum delay, default **60 seconds**.
+- On `FloodWaitError`, the affected account immediately stops the current round. Telegram's wait plus a safety gap is saved in local `promo.db` and survives a bot restart; there is no immediate retry.
+- On `PeerFloodError`, the affected account is held for at least 24 hours. A hold is a safety measure **not** a way to remove restrictions; check the account's actual Telegram status before sending again.
+- Slow-mode/write-forbidden groups are skipped; no attempt is made to bypass their limits.
+- **No configuration can guarantee Telegram won't impose restrictions.** Send only to groups where you have permission to advertise.
+
+Add these optional settings to `.env`:
+
+```env
+GROUP_DELAY_SECONDS=30
+DM_BROADCAST_DELAY_SECONDS=60
+RESTRICTION_PAUSE_HOURS=24
+```
+
+Changing the delay from the admin menu stores the setting in `promo.db`, overriding `.env` after the first run.
+
+
+## DM auto-reply while group promotion or manual DM broadcast runs
+
+All sends and incoming DM events for one real account now share **one persistent
+Telethon client**. The account's outgoing pacing queue prioritizes replies from
+people who message the account, without bypassing its existing rate limits.
+A reply may still wait for the remaining group-message gap or Telegram FloodWait.
+The reply cooldown starts after a successful send (not while a reply waits).
+
+`DM_REPLY_SEND_GAP_SECONDS=5` can be changed in `.env`. Unlike the separate
+5-minute `DM_REPLY_COOLDOWN_SECONDS`, this controls pacing between outgoing sends.
+There is no need to toggle off scheduled promotions to receive incoming DMs.
+
+The admin control bot's separate auto-reply remains enabled independently.
