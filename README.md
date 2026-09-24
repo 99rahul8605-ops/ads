@@ -215,3 +215,33 @@ The reply cooldown starts after a successful send (not while a reply waits).
 There is no need to toggle off scheduled promotions to receive incoming DMs.
 
 The admin control bot's separate auto-reply remains enabled independently.
+
+## Multi-user access (owner-controlled)
+
+Only the `ADMIN_ID` owner can grant or revoke access. There is **no access-request
+flow** and other users cannot approve anyone. Send these commands in the bot's
+private chat:
+
+- `/add 123456789` — grant this Telegram user ID operator access.
+- `/rem 123456789` — immediately revoke access and stop that operator's jobs
+  and account listeners; their encrypted data is kept for possible reapproval.
+- `/users` — list all approved operators.
+
+A newly approved operator can open `/start` and use the same menu, but will see
+**only their own** Telegram sessions, saved posts, promotion settings and stats.
+Owner data remains in the original `promo.db`, `media/` and existing MongoDB
+session records. New operators each receive `operators/<uid>/promo.db`,
+`operators/<uid>/media/` and independently tagged MongoDB session records.
+Their recurring promotion tasks, one-off DM broadcast status and auto-reply
+listeners are isolated from other operators. A session already stored for one
+operator cannot be claimed by another; every Telegram account should only be
+connected by its owner.
+
+Access permissions survive restarts in MongoDB's `approved_operators` collection.
+Save the original `.env`, `promo.db` and `media` folder when upgrading, and
+include the `database.py` update in this release. `FERNET_KEY` must remain the
+same to decrypt the owner and operator accounts.
+
+Optional `.env` setting: `OPERATORS_DIR=operators` controls the per-operator
+SQLite/media directory. Operator data is local to your deployment; back up
+`operators/` along with `promo.db`, `media/` and MongoDB.

@@ -162,17 +162,26 @@ class MongoSessionStore:
     thread so the Telegram event loop stays responsive.
     """
 
-    def __init__(self, uri: str, db_name: str = "promo_bot"):
+    def __init__(self, uri: str, db_name: str = "promo_bot", owner_id: int | None = None, primary_owner: bool = False):
         self.uri = uri
         self.db_name = db_name
         self.client = MongoClient(uri, serverSelectionTimeoutMS=10000)
         self.collection = self.client[db_name]["sessions"]
+        self.owner_id = owner_id
+        self.primary_owner = primary_owner
+
+    def _owner_filter(self):
+        if self.primary_owner:
+            # Backward compatibility: pre-multiuser sessions have no owner_id.
+            return {"$or": [{"owner_id": self.owner_id}, {"owner_id": {"$exists": False}}]}
+        return {"owner_id": self.owner_id}
 
     async def init(self):
         def _init():
             self.client.admin.command("ping")
             self.collection.create_index([("tg_user_id", ASCENDING)], unique=True)
             self.collection.create_index([("enabled", ASCENDING)])
+            self.collection.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING)])
 
         await asyncio.to_thread(_init)
 
@@ -182,12 +191,13 @@ class MongoSessionStore:
         def _add():
             # One stored session per Telegram user account. Re-adding refreshes it.
             self.collection.update_one(
-                {"tg_user_id": int(tg_user_id)},
+                dict(self._owner_filter(), tg_user_id=int(tg_user_id)) if not self.primary_owner else {"$and": [self._owner_filter(), {"tg_user_id": int(tg_user_id)}]},
                 {
                     "$set": {
                         "label": label,
                         "session_enc": session_enc,
                         "tg_user_id": int(tg_user_id),
+                        "owner_id": self.owner_id,
                         "username": username,
                         "first_name": first_name,
                         "enabled": True,
@@ -197,7 +207,7 @@ class MongoSessionStore:
                 },
                 upsert=True,
             )
-            doc = self.collection.find_one({"tg_user_id": int(tg_user_id)}, {"_id": 1})
+            doc = self.collection.find_one({"$and": [self._owner_filter(), {"tg_user_id": int(tg_user_id)}]}, {"_id": 1})
             return str(doc["_id"])
 
         return await asyncio.to_thread(_add)
@@ -216,7 +226,7 @@ class MongoSessionStore:
 
     async def get_sessions(self, enabled_only=False):
         def _get():
-            query = {"enabled": True} if enabled_only else {}
+            query = {"$and": [self._owner_filter(), {"enabled": True}]} if enabled_only else self._owner_filter()
             docs = list(self.collection.find(query).sort("created_at", ASCENDING))
             return [self._serialize(d) for d in docs]
 
@@ -235,7 +245,7 @@ class MongoSessionStore:
                     query = {"tg_user_id": int(session_id)}
                 else:
                     return 0
-            return self.collection.delete_one(query).deleted_count
+            return self.collection.delete_one({"$and": [self._owner_filter(), query]}).deleted_count
 
         return await asyncio.to_thread(_delete)
 

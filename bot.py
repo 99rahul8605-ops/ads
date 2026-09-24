@@ -4,6 +4,8 @@ import logging
 import os
 import time
 import random
+import contextvars
+from functools import wraps
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -90,8 +92,9 @@ configure_logging()
 log = logging.getLogger("promo-bot")
 
 pacer = AccountPacer()
-db = Database(DB_PATH)
-session_store = MongoSessionStore(MONGO_URI, MONGO_DB)
+# Tenant-aware proxies are initialized below, after RuntimeStats is declared.
+# Operator data is stored independently in operators/<uid>/promo.db, media/ and
+# MongoDB sessions tagged with owner_id. Legacy owner sessions remain accessible.
 
 MENU = ReplyKeyboardMarkup(
     [
@@ -191,7 +194,7 @@ async def reply_panel_text() -> str:
         f"🤖 Control bot: <b>{'ON' if bot else 'OFF'}</b>\n"
         f"📝 Real-ID reply mode: <b>{'Saved promo post' if saved_post else 'Custom text'}</b>\n"
         f"⏱ Cooldown: <b>{cooldown // 60} min</b>\n\n"
-        f"📡 Real-ID listeners connected: <b>{sum(c.is_connected() for c in _account_dm_clients.values())}</b>\n"
+        f"📡 Real-ID listeners connected: <b>{sum(c.is_connected() for sid, c in _account_dm_clients.items() if sid in {str(row["id"]) for row in await session_store.get_sessions()})}</b>\n"
         f"✅ Account replies sent since restart: <b>{_reply_sent_counts['accounts']}</b>\n\n"
         "Choose a button to edit. Changes apply without restart."
     )
@@ -204,7 +207,16 @@ _account_dm_clients: dict[str, TelegramClient] = {}
 _account_client_locks: dict[str, asyncio.Lock] = {}
 _account_reply_timestamps: dict[tuple[str, int], float] = {}
 _account_reply_pending: set[tuple[str, int]] = set()
-_reply_sent_counts = {"accounts": 0, "control_bot": 0, "failed": 0}
+_TENANT_REPLY_COUNTS: dict[int, dict[str, int]] = {}
+class _ReplyCountProxy:
+    def _data(self):
+        return _TENANT_REPLY_COUNTS.setdefault(tenant_id(),
+                                                {"accounts": 0, "control_bot": 0, "failed": 0})
+    def __getitem__(self, key):
+        return self._data()[key]
+    def __setitem__(self, key, value):
+        self._data()[key] = value
+_reply_sent_counts = _ReplyCountProxy()
 _bot_reply_timestamps: dict[int, float] = {}
 
 scan_locks: dict[str, asyncio.Lock] = {}
@@ -243,13 +255,124 @@ class RuntimeStats:
     cached_group_count: dict = field(default_factory=dict)
     cached_user_count: dict = field(default_factory=dict)
 
-stats = RuntimeStats()
-promo_task: asyncio.Task | None = None
+# The current operator is bound to each bot update and inherited by background
+# tasks. The owner retains the original DB_PATH, MEDIA_DIR and legacy sessions.
+CURRENT_OPERATOR = contextvars.ContextVar("operator", default=ADMIN_ID)
+APPROVED_USERS: set[int] = {ADMIN_ID}
+TENANT_DB: dict[int, Database] = {}
+TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
+TENANT_STATS: dict[int, RuntimeStats] = {}
+PROMO_TASKS: dict[int, asyncio.Task] = {}
+LISTENER_TASKS: dict[int, asyncio.Task] = {}
+OPERATORS_DIR = Path(os.getenv("OPERATORS_DIR", "operators"))
+
+# Owner-only operator access list; a separate collection from encrypted sessions.
+from pymongo import MongoClient as _AccessMongoClient
+_access_mongo = _AccessMongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+operator_access = _access_mongo[MONGO_DB]["approved_operators"]
+
+def tenant_id() -> int:
+    return CURRENT_OPERATOR.get()
+
+def tenant_db(uid: int) -> Database:
+    if uid not in TENANT_DB:
+        path = DB_PATH if uid == ADMIN_ID else str(OPERATORS_DIR / str(uid) / "promo.db")
+        TENANT_DB[uid] = Database(path)
+    return TENANT_DB[uid]
+
+def tenant_sessions(uid: int) -> MongoSessionStore:
+    if uid not in TENANT_SESSIONS:
+        TENANT_SESSIONS[uid] = MongoSessionStore(MONGO_URI, MONGO_DB, owner_id=uid,
+                                                primary_owner=(uid == ADMIN_ID))
+    return TENANT_SESSIONS[uid]
+
+def tenant_stats(uid: int) -> RuntimeStats:
+    return TENANT_STATS.setdefault(uid, RuntimeStats())
+
+class _TenantProxy:
+    def __init__(self, get_instance):
+        object.__setattr__(self, "get_instance", get_instance)
+    def __getattr__(self, name):
+        return getattr(self.get_instance(tenant_id()), name)
+    def __setattr__(self, name, value):
+        setattr(self.get_instance(tenant_id()), name, value)
+
+db = _TenantProxy(tenant_db)
+session_store = _TenantProxy(tenant_sessions)
+stats = _TenantProxy(tenant_stats)
 state: dict[int, str] = {}
+
+def tenant_media_dir() -> Path:
+    result = MEDIA_DIR if tenant_id() == ADMIN_ID else OPERATORS_DIR / str(tenant_id()) / "media"
+    result.mkdir(parents=True, exist_ok=True)
+    return result
+
+def broadcast_running(app):
+    return app.bot_data.get(f"dm_broadcast_running:{tenant_id()}", False)
+
+def set_broadcast_running(app, value):
+    app.bot_data[f"dm_broadcast_running:{tenant_id()}"] = value
+
+def get_broadcast_task(app):
+    return app.bot_data.get(f"dm_broadcast_task:{tenant_id()}")
+
+def set_broadcast_task(app, task):
+    app.bot_data[f"dm_broadcast_task:{tenant_id()}"] = task
+
+async def load_approved_users():
+    docs = await asyncio.to_thread(lambda: list(operator_access.find({}, {"_id": 1})))
+    APPROVED_USERS.clear()
+    APPROVED_USERS.add(ADMIN_ID)
+    APPROVED_USERS.update(int(doc["_id"]) for doc in docs)
+
+async def initialize_tenant(uid: int):
+    token = CURRENT_OPERATOR.set(uid)
+    try:
+        await tenant_db(uid).init()
+        await tenant_sessions(uid).init()
+        if await db.get_setting("interval_minutes") is None:
+            await db.set_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
+        if await db.get_setting("group_delay_seconds") is None:
+            await db.set_setting("group_delay_seconds", str(GROUP_DELAY_SECONDS))
+        stats.group_delay_seconds = await get_group_delay()
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+async def start_tenant_listener(app, uid: int):
+    task = LISTENER_TASKS.get(uid)
+    if task is not None and not task.done():
+        return
+    token = CURRENT_OPERATOR.set(uid)
+    try:
+        LISTENER_TASKS[uid] = asyncio.create_task(account_auto_reply_service(app),
+                                                  name=f"account_dm_auto_reply_{uid}")
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+def authorized_handler(handler):
+    @wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user:
+            return
+        uid = update.effective_user.id
+        if update.effective_chat.type != "private":
+            # Sessions and account controls must not be exposed to group chats.
+            return
+        if uid not in APPROVED_USERS:
+            if handler is start and update.message:
+                await update.message.reply_text("⛔ Access denied. Contact the bot owner.")
+            return
+        token = CURRENT_OPERATOR.set(uid)
+        try:
+            return await handler(update, context)
+        finally:
+            CURRENT_OPERATOR.reset(token)
+    return wrapped
+
 
 
 def admin_only(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
+    return bool(update.effective_user and update.effective_user.id in APPROVED_USERS and update.effective_user.id == tenant_id())
 
 
 def esc(s):
@@ -367,7 +490,15 @@ async def get_account_client(row: dict) -> TelegramClient:
         client = await make_client(decrypt_session(row["session_enc"]))
         # Register on the SAME client that broadcasts will use. The handler
         # checks its enabled setting on every incoming message.
-        client.add_event_handler(account_reply_handler(sid), events.NewMessage(incoming=True))
+        owner = tenant_id()
+        handler = account_reply_handler(sid)
+        async def scoped_dm(event):
+            token = CURRENT_OPERATOR.set(owner)
+            try:
+                return await handler(event)
+            finally:
+                CURRENT_OPERATOR.reset(token)
+        client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
         _account_dm_clients[sid] = client
         log.info("Account DM listener ready for %s", row.get("label", sid))
         return client
@@ -686,7 +817,7 @@ async def do_round(app: Application):
 
     progress_msg = None
     try:
-        progress_msg = await app.bot.send_message(ADMIN_ID, stats_text(), parse_mode=ParseMode.HTML)
+        progress_msg = await app.bot.send_message(tenant_id(), stats_text(), parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -759,7 +890,7 @@ async def run_one_time_dm_broadcast(app: Application):
 
     progress_msg = None
     try:
-        progress_msg = await app.bot.send_message(ADMIN_ID, "📨 <b>DM BROADCAST STARTED</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+        progress_msg = await app.bot.send_message(tenant_id(), "📨 <b>DM BROADCAST STARTED</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -847,11 +978,11 @@ async def dm_broadcast_runner(app: Application):
     except Exception as exc:
         log.warning("Manual DM broadcast failed: %s", type(exc).__name__)
         try:
-            await app.bot.send_message(ADMIN_ID, "⚠️ Manual DM broadcast stopped because of an error.")
+            await app.bot.send_message(tenant_id(), "⚠️ Manual DM broadcast stopped because of an error.")
         except Exception:
             pass
     finally:
-        app.bot_data["dm_broadcast_running"] = False
+        set_broadcast_running(app, False)
 
 
 async def scheduler(app: Application):
@@ -865,7 +996,7 @@ async def scheduler(app: Application):
             except Exception as e:
                 stats.last_error = f"{type(e).__name__}: {e}"
                 try:
-                    await app.bot.send_message(ADMIN_ID, f"⚠️ Promotion round error:\n<code>{esc(stats.last_error)}</code>", parse_mode=ParseMode.HTML)
+                    await app.bot.send_message(tenant_id(), f"⚠️ Promotion round error:\n<code>{esc(stats.last_error)}</code>", parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
 
@@ -887,7 +1018,7 @@ async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages sent directly to the *admin control bot*."""
     if not await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED) or not update.message or not update.effective_user:
         return
-    if update.effective_user.id == ADMIN_ID or update.effective_user.is_bot:
+    if update.effective_user.id in APPROVED_USERS or update.effective_user.is_bot:
         return
     if update.effective_chat.type != "private":
         return
@@ -969,16 +1100,19 @@ def account_reply_handler(session_key: str):
 
 async def account_auto_reply_service(app: Application):
     """Keep one Telegram connection per enabled account, shared by all workloads."""
+    my_session_ids = set()
     try:
         while True:
             try:
                 rows = await session_store.get_sessions(enabled_only=True)
                 enabled = {str(row["id"]): row for row in rows}
-                for sid in list(_account_dm_clients):
+                my_session_ids.update(enabled)
+                for sid in list(my_session_ids):
                     if sid not in enabled:
                         # Do not interrupt an active broadcast; revoke afterward.
-                        if not stats.running and not app.bot_data.get("dm_broadcast_running"):
+                        if not stats.running and not broadcast_running(app):
                             await close_account_client(sid)
+                            my_session_ids.discard(sid)
                 for sid, row in enabled.items():
                     try:
                         await get_account_client(row)
@@ -996,9 +1130,76 @@ async def account_auto_reply_service(app: Application):
         raise
     finally:
         # This manager is the sole owner of persistent account connections.
-        await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
+        await asyncio.gather(*(close_account_client(sid) for sid in list(my_session_ids)),
                              return_exceptions=True)
 
+
+
+async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID or update.effective_chat.type != "private":
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit() or int(context.args[0]) <= 0:
+        return await update.message.reply_text("Usage: /add <Telegram user ID>")
+    uid = int(context.args[0])
+    if uid == ADMIN_ID:
+        return await update.message.reply_text("You already have owner access.")
+    if uid in APPROVED_USERS:
+        return await update.message.reply_text(f"✅ {uid} already has access.")
+    try:
+        await initialize_tenant(uid)
+        await asyncio.to_thread(lambda: operator_access.update_one(
+            {"_id": uid}, {"$set": {"approved_by": ADMIN_ID, "approved_at": time.time()}}, upsert=True))
+        APPROVED_USERS.add(uid)
+        await start_tenant_listener(context.application, uid)
+        await update.message.reply_text(f"✅ Added {uid}. Their sessions, posts, media and jobs are separate.\n\nThey can now open /start.")
+        try:
+            await context.bot.send_message(uid, "✅ The owner has granted you access. Open /start to begin.")
+        except Exception:
+            pass  # Operator may not have started the bot yet.
+    except Exception:
+        log.exception("Failed to approve operator %s", uid)
+        await update.message.reply_text("❌ Unable to add user. Check the server logs.")
+
+async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID or update.effective_chat.type != "private":
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        return await update.message.reply_text("Usage: /rem <Telegram user ID>")
+    uid = int(context.args[0])
+    if uid == ADMIN_ID:
+        return await update.message.reply_text("The owner cannot be removed.")
+    if uid not in APPROVED_USERS:
+        return await update.message.reply_text("That user is not approved.")
+    APPROVED_USERS.discard(uid)  # Reject new actions before stopping existing jobs.
+    await asyncio.to_thread(operator_access.delete_one, {"_id": uid})
+    st = tenant_stats(uid)
+    st.running = False
+    tasks = [PROMO_TASKS.pop(uid, None), LISTENER_TASKS.pop(uid, None)]
+    tasks.append(context.application.bot_data.pop(f"dm_broadcast_task:{uid}", None))
+    context.application.bot_data[f"dm_broadcast_running:{uid}"] = False
+    for task in tasks:
+        if task and not task.done():
+            task.cancel()
+    await asyncio.gather(*(t for t in tasks if t), return_exceptions=True)
+    token = CURRENT_OPERATOR.set(uid)
+    try:
+        # Disable stored accounts until explicit reapproval, preserving encrypted
+        # sessions for the operator in case the owner approves them again.
+        rows = await tenant_sessions(uid).get_sessions()
+        await asyncio.gather(*(close_account_client(str(row["id"])) for row in rows),
+                             return_exceptions=True)
+    finally:
+        CURRENT_OPERATOR.reset(token)
+    await update.message.reply_text(f"🚫 Removed {uid}. Their sessions/data remain isolated and cannot be used without access.")
+
+async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID or update.effective_chat.type != "private":
+        return
+    operators = sorted(APPROVED_USERS - {ADMIN_ID})
+    if not operators:
+        return await update.message.reply_text("👥 No other users approved. Add one with /add <uid>.")
+    lines = ["👥 Approved users:"] + [f"• <code>{uid}</code>" for uid in operators]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
@@ -1040,7 +1241,6 @@ async def safe_delete_message(message):
 
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global promo_task
     if not admin_only(update) or not update.message:
         return
     uid = update.effective_user.id
@@ -1164,7 +1364,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state.pop(uid, None)
             await preview_saved_post(update.message, post)
             return
-        if stats.running or context.application.bot_data.get("dm_broadcast_running"):
+        if stats.running or broadcast_running(context.application):
             await update.message.reply_text("⏹ Stop the ongoing broadcast before modifying posts.", reply_markup=POST_MENU)
             state.pop(uid, None)
             return
@@ -1461,7 +1661,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(scan_text, parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "▶️ Start Promo":
-        if (promo_task and not promo_task.done()) or context.application.bot_data.get("dm_broadcast_running"):
+        if (PROMO_TASKS.get(uid) and not PROMO_TASKS[uid].done()) or broadcast_running(context.application):
             await update.message.reply_text("🟢 A broadcast is already running.", reply_markup=MENU)
             return
         if not await db.get_post():
@@ -1471,22 +1671,22 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
         stats.running = True
-        promo_task = asyncio.create_task(scheduler(context.application), name="promo_scheduler")
+        PROMO_TASKS[uid] = asyncio.create_task(scheduler(context.application), name=f"promo_scheduler_{uid}")
         await update.message.reply_text("▶️ Promotion started. Use 📊 Live Stats to check progress.", reply_markup=MENU)
 
     elif text == "⏹ Stop Promo":
         stats.running = False
-        if promo_task and not promo_task.done():
-            promo_task.cancel()
+        if PROMO_TASKS.get(uid) and not PROMO_TASKS[uid].done():
+            PROMO_TASKS[uid].cancel()
             try:
-                await promo_task
+                await PROMO_TASKS[uid]
             except asyncio.CancelledError:
                 pass
-        promo_task = None
+        PROMO_TASKS.pop(uid, None)
         await update.message.reply_text("⏹ Promotion stopped.", reply_markup=MENU)
 
     elif text == "📨 DM Broadcast":
-        if context.application.bot_data.get("dm_broadcast_running"):
+        if broadcast_running(context.application):
             await update.message.reply_text("🟢 Manual DM broadcast is already running.", reply_markup=MENU)
             return
         if stats.running:
@@ -1499,9 +1699,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
         await update.message.reply_text("📨 One-time broadcast to existing private DM dialogs started. Use 📊 Live Stats for progress.", reply_markup=MENU)
-        context.application.bot_data["dm_broadcast_running"] = True
-        context.application.bot_data["dm_broadcast_task"] = asyncio.create_task(
-            dm_broadcast_runner(context.application), name="one_time_dm_broadcast")
+        set_broadcast_running(context.application, True)
+        set_broadcast_task(context.application, asyncio.create_task(
+            dm_broadcast_runner(context.application), name=f"one_time_dm_broadcast_{uid}"))
 
     elif text == "📊 Live Stats":
         stats.active_posts = len(await db.list_posts(enabled_only=True))
@@ -1532,24 +1732,24 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m.photo:
             kind = media_type = "photo"
             tgfile = await m.photo[-1].get_file()
-            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}.jpg")
+            media_path = str(tenant_media_dir() / f"promo_{int(time.time()*1000)}_{m.message_id}.jpg")
             await tgfile.download_to_drive(media_path)
         elif m.video:
             kind = media_type = "video"
             tgfile = await m.video.get_file()
             suffix = Path(m.video.file_name or "video.mp4").suffix or ".mp4"
-            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
+            media_path = str(tenant_media_dir() / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
             await tgfile.download_to_drive(media_path)
         elif m.document:
             kind = media_type = "document"
             tgfile = await m.document.get_file()
             suffix = Path(m.document.file_name or "file.bin").suffix or ".bin"
-            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
+            media_path = str(tenant_media_dir() / f"promo_{int(time.time()*1000)}_{m.message_id}{suffix}")
             await tgfile.download_to_drive(media_path)
         elif m.animation:
             kind = media_type = "animation"
             tgfile = await m.animation.get_file()
-            media_path = str(MEDIA_DIR / f"promo_{int(time.time()*1000)}_{m.message_id}.mp4")
+            media_path = str(tenant_media_dir() / f"promo_{int(time.time()*1000)}_{m.message_id}.mp4")
             await tgfile.download_to_drive(media_path)
         elif not m.text:
             await m.reply_text("❌ Unsupported post type. Send text/photo/video/document/animation.", reply_markup=MENU)
@@ -1564,35 +1764,29 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    await db.init()
-    await session_store.init()
-    if await db.get_setting("interval_minutes") is None:
-        await db.set_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
-    if await db.get_setting("group_delay_seconds") is None:
-        await db.set_setting("group_delay_seconds", str(GROUP_DELAY_SECONDS))
-    stats.group_delay_seconds = await get_group_delay()
-    app.bot_data["dm_listener_task"] = asyncio.create_task(account_auto_reply_service(app), name="account_dm_auto_reply")
+    await load_approved_users()
+    # Owner database and legacy encrypted sessions are never migrated/deleted.
+    for uid in sorted(APPROVED_USERS):
+        await initialize_tenant(uid)
+        await start_tenant_listener(app, uid)
 
 
 async def post_shutdown(app: Application):
-    global promo_task
-    stats.running = False
-    outgoing = [promo_task, app.bot_data.pop("dm_broadcast_task", None)]
-    for job in outgoing:
-        if job and not job.done():
-            job.cancel()
-    await asyncio.gather(*(job for job in outgoing if job), return_exceptions=True)
-    promo_task = None
-    task = app.bot_data.pop("dm_listener_task", None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    # Defensive cleanup for partial startup or a previously failed listener manager.
+    for st in TENANT_STATS.values():
+        st.running = False
+    jobs = list(PROMO_TASKS.values()) + list(LISTENER_TASKS.values())
+    jobs += [value for key, value in app.bot_data.items() if key.startswith("dm_broadcast_task:") and value]
+    for task in jobs:
+        if task and not task.done():
+            task.cancel()
+    await asyncio.gather(*(task for task in jobs if task), return_exceptions=True)
+    PROMO_TASKS.clear()
+    LISTENER_TASKS.clear()
     await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
                          return_exceptions=True)
+    for store in TENANT_SESSIONS.values():
+        await store.close()
+    await asyncio.to_thread(_access_mongo.close)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1601,13 +1795,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_operator))
+    app.add_handler(CommandHandler("rem", remove_operator))
+    app.add_handler(CommandHandler("users", list_operators))
+    app.add_handler(CommandHandler("start", authorized_handler(start)))
     # Save-post handler must run before the generic text/menu handler.
-    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION), save_post_message), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_post_message), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu), group=1)
+    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION), authorized_handler(save_post_message)), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, authorized_handler(save_post_message)), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, authorized_handler(handle_menu)), group=1)
     # A stranger messaging the control bot receives a cooldown-limited response.
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, bot_dm_auto_reply), group=2)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, authorized_handler(bot_dm_auto_reply)), group=2)
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
