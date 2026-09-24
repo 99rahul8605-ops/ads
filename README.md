@@ -298,3 +298,24 @@ repeat interval starts **after** the round finishes, so a 30-minute interval
 can result in at least 60 minutes between two posts in the same group. Setting
 the gap too low can trigger Telegram rate limits; the bot does not bypass
 FloodWait or account restrictions. See `.env.example` for pacing settings.
+
+## FloodWait automatic resume (September 2026)
+
+- Each Telegram account has an independent, persisted cooldown. The affected
+  account does not attempt another send until Telegram's required pause ends.
+- Short FloodWaits (up to 10 minutes) resume automatically **within the current
+  promotion round**, continuing with the next target (no immediate retry of the
+  rate-limited target). Other accounts keep promoting independently.
+- If an account was already in a short FloodWait at round start, an independent
+  delayed worker resumes it when eligible without holding up other accounts.
+- Long FloodWaits are automatically rechecked at the persisted expiry or the
+  next scheduled promotion interval, whichever comes first. This avoids holding
+  all future promotion rounds behind a multi-hour pause.
+- Per-account stats show `Paused (FloodWait)`, a countdown and `Running` on
+  resume. `logs/<session-id>-promo.log` includes PAUSED and RESUMED entries.
+- Telegram `PeerFlood` restrictions are not treated as normal FloodWaits and
+  are not automatically retried within a round. Restrictions may remain after
+  a timer expires; only Telegram can remove them.
+
+Keep your current `.env`, MongoDB data, `promo.db`, encryption key, and `media/`
+when upgrading. The changes are in `bot.py`; existing `pacing.py` is included.

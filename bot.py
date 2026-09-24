@@ -876,6 +876,51 @@ async def pause_account(session_id: str, seconds: float, reason: str):
     log.warning("Session %s paused for %ss: %s", session_id, max(1, int(until-time.time())), reason)
 
 
+async def log_account_state(row, metric, state, detail=""):
+    """Write PAUSED/RESUMED events without treating them as delivery attempts."""
+    key = metric_key(row["id"], metric["kind"])
+    line = (f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC | "
+            f"{state} | {row['label']}" + (f" | {detail}" if detail else ""))
+    ACCOUNT_EVENTS.setdefault(key, deque(maxlen=30)).append(line)
+    log.info("account=%s tenant=%s mode=%s %s", row["label"], tenant_id(), metric["kind"], line)
+    try:
+        await asyncio.to_thread(_append_account_log, account_log_path(key), line)
+    except OSError:
+        log.warning("Account log write failed for %s", row["label"])
+
+
+async def wait_for_flood_release(row, metric):
+    """Wait for Telegram's *persisted* FloodWait, without holding the pacing lock.
+
+    Another session's promotion worker keeps running normally.  Read the stored
+    expiry on each check: another workload may extend the same account's pause.
+    Never auto-retry a target whose send got a FloodWait.
+    """
+    sid = str(row["id"])
+    metric["status"] = "Paused (FloodWait)"
+    await log_account_state(row, metric, "PAUSED", "Waiting for Telegram cooldown")
+    while stats.running:
+        remaining = await get_pause_remaining(sid)
+        if remaining <= 0:
+            metric["status"] = "Running"
+            metric["target"] = "Resumed after Telegram cooldown"
+            await db.set_setting(f"account_pause_reason:{sid}", "")
+            await log_account_state(row, metric, "RESUMED", "Telegram cooldown expired")
+            await edit_account_progress(row, metric, force=True)
+            return True
+        # Keep other accounts' future promotion rounds independent of a very
+        # long pause. The scheduler will re-check the persisted deadline.
+        if remaining > 600:
+            metric["status"] = "Paused (scheduled recheck)"
+            await log_account_state(row, metric, "PAUSED", "Long cooldown; scheduled automatic recheck")
+            await edit_account_progress(row, metric, force=True)
+            return False
+        metric["target"] = f"FloodWait: {fmt_duration(remaining)} remaining"
+        await edit_account_progress(row, metric)
+        await asyncio.sleep(min(10, remaining))
+    return False
+
+
 class AccountPausedError(Exception):
     def __init__(self, remaining: int):
         self.remaining = int(remaining)
@@ -934,6 +979,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 last_random_post_by_target[target_key] = post["id"]
             stats.current_post = f"#{post['id']}"
             stop_this_account = False
+            resume_after_flood = False
             outcome, error = "sent", ""
             metric["target"] = f"{target_type}: {name}"
             try:
@@ -981,7 +1027,9 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 await pause_account(sid, wait, f"Telegram FloodWait ({e.seconds}s)")
                 stats.last_error = f"{row['label']}: FloodWait {e.seconds}s; account paused"
                 stats.paused_sessions += 1
-                stop_this_account = True
+                # The current target is skipped; resume the NEXT target once
+                # Telegram's stated FloodWait expires, even in this same round.
+                resume_after_flood = True
             except errors.PeerFloodError:
                 outcome, error = "skipped", "Account restricted (PeerFlood)"
                 # PeerFlood indicates an account-level anti-spam restriction.
@@ -1021,9 +1069,12 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 else:
                     stats.user_attempted += 1
 
-            await edit_account_progress(row, metric, force=stop_this_account)
+            await edit_account_progress(row, metric, force=stop_this_account or resume_after_flood)
             if stop_this_account:
                 break
+            if resume_after_flood:
+                if not await wait_for_flood_release(row, metric):
+                    return
             # No explicit sleep here: AccountPacer enforces the minimum gap
             # between completed sends, including interleaved DM auto-replies.
     finally:
@@ -1057,6 +1108,7 @@ async def do_round(app: Application):
     stats.group_delay_seconds = await get_group_delay()
 
     prepared = []
+    initially_paused = []
     # Connect sessions concurrently. A target scan occurs only when cache is missing/stale.
     async def prepare(row):
         client = None
@@ -1079,6 +1131,11 @@ async def do_round(app: Application):
         if isinstance(err, tuple) and err[0] == "paused":
             stats.paused_sessions += 1
             stats.last_error = f"{row['label']}: account cooling down ({fmt_duration(err[1])} left)"
+            # This account gets its own delayed worker; the other sessions
+            # can send immediately instead of waiting for this cooldown.
+            reason = await db.get_setting(f"account_pause_reason:{row['id']}", "")
+            if err[1] <= 600 and "PeerFlood" not in reason:
+                initially_paused.append(row)
             continue
         if err:
             stats.failed += 1
@@ -1104,9 +1161,48 @@ async def do_round(app: Application):
             ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
         except Exception:
             pass
-    # Accounts are scheduled concurrently. Every account has its own live status.
-    await asyncio.gather(*(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metrics[str(row['id'])])
-                           for row, client, groups, users in prepared))
+    async def resume_prepaused(row):
+        """Reconnect only this account when a pre-existing FloodWait expires."""
+        sid = str(row["id"])
+        metric = begin_metric(row, 'promo')
+        metrics[sid] = metric
+        try:
+            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
+            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
+        except Exception:
+            pass
+        if not await wait_for_flood_release(row, metric):
+            return
+        try:
+            # An independent account may encounter a new Telegram cooldown
+            # while reconnecting. Persist it and let the scheduler recheck.
+            client = await get_account_client(row)
+            groups, users, _ = await get_cached_targets(row, client, force=False)
+        except errors.FloodWaitError as e:
+            await pause_account(sid, e.seconds + stats.group_delay_seconds,
+                                f"Telegram FloodWait while resuming ({e.seconds}s)")
+            metric["status"] = "Paused (new FloodWait)"
+            await log_account_state(row, metric, "PAUSED", f"New FloodWait: {e.seconds}s")
+            await edit_account_progress(row, metric, force=True)
+            return
+        except Exception as e:
+            metric["status"] = "Connection failed"
+            metric["last_error"] = f"{type(e).__name__}: {e}"
+            await edit_account_progress(row, metric, force=True)
+            return
+        metric["total"] = len(groups) + len(users)
+        metric["groups"] = len(groups)
+        metric["users"] = len(users)
+        stats.total_groups += len(groups)
+        stats.total_users += len(users)
+        await _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metric)
+
+    # Normal and cooling-down accounts have independent concurrent workers.
+    await asyncio.gather(
+        *(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metrics[str(row['id'])])
+          for row, client, groups, users in prepared),
+        *(resume_prepaused(row) for row in initially_paused),
+    )
 
     if progress_msg:
         try:
@@ -1298,6 +1394,14 @@ async def scheduler(app: Application):
             interval = int(await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES)))
             interval = max(5, interval)
             stats.next_round_at = time.time() + interval * 60
+            # A session that was already paused when the round started should
+            # not wait an extra full promotion interval after its FloodWait ends.
+            for session in await session_store.get_sessions(enabled_only=True):
+                sid = str(session["id"])
+                remaining = await get_pause_remaining(sid)
+                if remaining and "PeerFlood" not in (await db.get_setting(
+                        f"account_pause_reason:{sid}", "")):
+                    stats.next_round_at = min(stats.next_round_at, time.time() + remaining)
             while stats.running and time.time() < stats.next_round_at:
                 await asyncio.sleep(min(5, max(0.2, stats.next_round_at - time.time())))
     finally:
