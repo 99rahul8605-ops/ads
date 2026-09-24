@@ -7,6 +7,8 @@ import random
 import contextvars
 from functools import wraps
 from dataclasses import dataclass, field
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -102,6 +104,7 @@ MENU = ReplyKeyboardMarkup(
         ["📝 Save Post", "📚 Manage Posts"],
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📊 Live Stats"],
+        ["📊 Account Stats", "📜 Account Logs"],
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["📨 DM Broadcast"],
         ["💬 Auto Reply"],
@@ -154,6 +157,9 @@ login_flows: dict[int, dict] = {}
 # Cached InputPeer objects avoid a fresh GetDialogsRequest on every promotion round.
 target_cache: dict[str, dict] = {}
 TARGET_CACHE_TTL = max(300, int(os.getenv("TARGET_CACHE_TTL_SECONDS", "21600")))
+# A join event updates the target list immediately; a slow background sync repairs
+# missed events after Telegram reconnects. No operator-initiated rescan is needed.
+AUTO_GROUP_SYNC_SECONDS = max(300, int(os.getenv("AUTO_GROUP_SYNC_SECONDS", "600")))
 
 # Direct replies only to people who initiate a private conversation.
 DM_AUTO_REPLY_ENABLED = os.getenv("DM_AUTO_REPLY_ENABLED", "true").lower() in {"true", "1", "yes", "on"}
@@ -220,6 +226,8 @@ _reply_sent_counts = _ReplyCountProxy()
 _bot_reply_timestamps: dict[int, float] = {}
 
 scan_locks: dict[str, asyncio.Lock] = {}
+# New groups seen before an account's first scan are merged into that scan.
+pending_groups: dict[str, dict] = {}
 # Avoid back-to-back repeats per target in Random mode (while the process is running).
 last_random_post_by_target: dict[tuple[str, str], int] = {}
 
@@ -270,6 +278,141 @@ OPERATORS_DIR = Path(os.getenv("OPERATORS_DIR", "operators"))
 from pymongo import MongoClient as _AccessMongoClient
 _access_mongo = _AccessMongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 operator_access = _access_mongo[MONGO_DB]["approved_operators"]
+
+# Account-specific, tenant-isolated statistics and durable log files.
+# Separate promotion and manual-DM counters, so two active accounts cannot
+# overwrite each other's current target or status.
+ACCOUNT_METRICS: dict[tuple[int, str, str], dict] = {}
+ACCOUNT_EVENTS: dict[tuple[int, str, str], deque] = {}
+ACCOUNT_PROGRESS_MESSAGES: dict[tuple[int, str, str], object] = {}
+
+
+def metric_key(session_id, kind):
+    return (tenant_id(), str(session_id), kind)
+
+
+def begin_metric(row, kind, total=0, groups=0, users=0):
+    key = metric_key(row["id"], kind)
+    metric = {
+        "label": str(row["label"]), "kind": kind, "total": total,
+        "groups": groups, "users": users, "attempted": 0,
+        "sent": 0, "failed": 0, "skipped": 0, "flood_waits": 0,
+        "group_sent": 0, "user_sent": 0,
+        "status": "Starting", "target": "-", "last_error": "-",
+        "started_at": time.time(), "last_edit": 0.0,
+    }
+    ACCOUNT_METRICS[key] = metric
+    ACCOUNT_EVENTS[key] = deque(maxlen=30)
+    return metric
+
+
+def account_stats_text(metric):
+    pct = 100 * metric["attempted"] / metric["total"] if metric["total"] else 0
+    return (
+        f"📊 <b>{'GROUP PROMOTION' if metric['kind'] == 'promo' else 'DM BROADCAST'} — ACCOUNT</b>\n"
+        f"👤 <b>{esc(metric['label'])}</b>\n"
+        f"State: <b>{esc(metric['status'])}</b>\n"
+        f"Progress: <b>{metric['attempted']}/{metric['total']}</b> ({pct:.0f}%)\n"
+        f"✅ Sent: <b>{metric['sent']}</b> | ❌ Failed: <b>{metric['failed']}</b> "
+        f"| ⏭ Skipped: <b>{metric['skipped']}</b>\n"
+        f"👥 Group sends: <b>{metric['group_sent']}</b> | 👤 DM sends: <b>{metric['user_sent']}</b>\n"
+        f"⏳ Flood waits: <b>{metric['flood_waits']}</b>\n"
+        f"🎯 Current: {esc(metric['target'])[:100]}\n"
+        f"⏱ Elapsed: <b>{fmt_duration(time.time()-metric['started_at'])}</b>\n"
+        f"⚠️ Last error: {esc(metric['last_error'])[:160]}"
+    )
+
+
+def account_log_path(key):
+    owner, sid, kind = key
+    safe_sid = ''.join(c for c in sid if c.isalnum() or c in '-_')[:80]
+    base = Path('logs') if owner == ADMIN_ID else OPERATORS_DIR / str(owner) / 'logs'
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f'{safe_sid}-{kind}.log'
+
+
+def _append_account_log(path, line):
+    with path.open('a', encoding='utf-8') as fp:
+        fp.write(line + '\n')
+
+
+async def record_account_event(row, metric, target_type, target_name, outcome, error=''):
+    key = metric_key(row['id'], metric['kind'])
+    metric['attempted'] += 1
+    metric['target'] = f"{target_type}: {target_name}"
+    if outcome == 'sent':
+        metric['sent'] += 1
+        metric['group_sent' if target_type == 'group' else 'user_sent'] += 1
+    elif outcome == 'skipped':
+        metric['skipped'] += 1
+    else:
+        metric['failed'] += 1
+    if error:
+        metric['last_error'] = error
+    line = (f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC | "
+            f"{outcome.upper()} | {target_type} | {target_name}"
+            + (f" | {error}" if error else ''))
+    ACCOUNT_EVENTS.setdefault(key, deque(maxlen=30)).append(line)
+    log.info('account=%s tenant=%s mode=%s %s', row['label'], tenant_id(), metric['kind'], line)
+    try:
+        await asyncio.to_thread(_append_account_log, account_log_path(key), line)
+    except OSError:
+        log.warning('Account log write failed for %s', row['label'])
+
+
+async def edit_account_progress(row, metric, *, force=False):
+    key = metric_key(row['id'], metric['kind'])
+    message = ACCOUNT_PROGRESS_MESSAGES.get(key)
+    if not message or (not force and time.monotonic() - metric['last_edit'] < 12):
+        return
+    metric['last_edit'] = time.monotonic()
+    try:
+        await message.edit_text(account_stats_text(metric), parse_mode=ParseMode.HTML)
+    except BadRequest as exc:
+        if 'not modified' not in str(exc).lower():
+            log.warning('Account progress edit failed: %s', type(exc).__name__)
+    except Exception as exc:
+        log.warning('Account progress edit failed: %s', type(exc).__name__)
+
+
+async def send_account_telemetry(update, kind):
+    rows = await session_store.get_sessions(enabled_only=False)
+    if not rows:
+        return await update.message.reply_text('No accounts saved.', reply_markup=MENU)
+    for row in rows:
+        sid = str(row['id'])
+        if kind == 'stats':
+            blocks = []
+            for mode in ('promo', 'dm'):
+                metric = ACCOUNT_METRICS.get(metric_key(sid, mode))
+                if metric:
+                    blocks.append(account_stats_text(metric))
+            if not blocks:
+                blocks.append(f"👤 <b>{esc(row['label'])}</b>\nNo sending activity since restart.")
+            # Separate message for each account, with distinct promo and DM sections.
+            for block in blocks:
+                await update.message.reply_text(block, parse_mode=ParseMode.HTML, reply_markup=MENU)
+        else:
+            for mode in ('promo', 'dm'):
+                key = metric_key(sid, mode)
+                recent = ACCOUNT_EVENTS.get(key)
+                if not recent:
+                    try:
+                        path = account_log_path(key)
+                        if path.exists():
+                            with path.open(encoding='utf-8', errors='replace') as f:
+                                recent = deque(f, maxlen=10)
+                    except OSError:
+                        recent = None
+                if recent:
+                    lines = list(recent)[-10:]
+                    heading = 'Group promotion' if mode == 'promo' else 'Manual DM broadcast'
+                    contents = '\n'.join(esc(x.strip())[:230] for x in lines)
+                    await update.message.reply_text(
+                        f"📜 <b>{esc(row['label'])} — {heading}</b>\n\n<code>{contents[:3100]}</code>",
+                        parse_mode=ParseMode.HTML, reply_markup=MENU)
+    return None
+
 
 def tenant_id() -> int:
     return CURRENT_OPERATOR.get()
@@ -452,8 +595,7 @@ def stats_text() -> str:
         f"✅ {stats.user_sent}  ❌ {stats.user_failed}  ⏭ {stats.user_skipped}\n\n"
         f"⏳ Flood waits: <b>{stats.flood_waits}</b> | Paused IDs: <b>{stats.paused_sessions}</b>\n"
         f"⏳ Minimum group gap: <b>{stats.group_delay_seconds}s</b>\n"
-        f"🔐 Session: <code>{esc(stats.current_session)}</code>\n"
-        f"🎯 Current: {esc(stats.current_group)}\n"
+        "👥 Per-account status: tap 📊 Account Stats or 📜 Account Logs\n"
         f"⏱ Elapsed: {elapsed}\n"
         f"🔁 Next round in: {next_run}\n"
         f"⚠️ Last error: <code>{esc(stats.last_error)[:500]}</code>"
@@ -499,6 +641,31 @@ async def get_account_client(row: dict) -> TelegramClient:
             finally:
                 CURRENT_OPERATOR.reset(token)
         client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
+        # Discover joined groups on this account's own update stream. The
+        # operator context ensures there is no cross-user cache/stat leakage.
+        me = await client.get_me()
+        my_id = me.id
+
+        async def scoped_group_join(event):
+            token = CURRENT_OPERATOR.set(owner)
+            try:
+                await handle_group_join_event(event, sid, my_id)
+            finally:
+                CURRENT_OPERATOR.reset(token)
+
+        async def scoped_group_message(event):
+            # Telegram sometimes supplies a channel update without a self-join
+            # ChatAction. The first message in the new group then repairs cache.
+            if not getattr(event, "is_group", False):
+                return
+            token = CURRENT_OPERATOR.set(owner)
+            try:
+                await remember_group_from_event(event, sid)
+            finally:
+                CURRENT_OPERATOR.reset(token)
+
+        client.add_event_handler(scoped_group_join, events.ChatAction())
+        client.add_event_handler(scoped_group_message, events.NewMessage(incoming=True))
         _account_dm_clients[sid] = client
         log.info("Account DM listener ready for %s", row.get("label", sid))
         return client
@@ -529,6 +696,92 @@ async def _input_peer(entity):
     if isinstance(entity, types.User):
         return types.InputPeerUser(entity.id, entity.access_hash or 0)
     return entity
+
+
+def _group_peer_key(peer):
+    """Stable identity for cached InputPeerChat and InputPeerChannel."""
+    if isinstance(peer, types.InputPeerChat):
+        return ("chat", int(peer.chat_id))
+    if isinstance(peer, types.InputPeerChannel):
+        return ("channel", int(peer.channel_id))
+    return (type(peer).__name__, str(peer))
+
+
+async def cache_joined_group(sid: str, entity, name: str) -> bool:
+    """Upsert a group instantly; never add broadcast-only channels or DMs."""
+    if not isinstance(entity, types.Chat) and not (
+        isinstance(entity, types.Channel) and getattr(entity, "megagroup", False)
+    ):
+        return False
+    if getattr(entity, "left", False) or getattr(entity, "deactivated", False):
+        return False
+    peer = await _input_peer(entity)
+    key = _group_peer_key(peer)
+    lock = scan_locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        cached = target_cache.get(sid)
+        if cached is None:
+            # A complete initial scan is still required to find older groups.
+            # The new group will also be present in that scan or in the pending
+            # event buffer if it arrives while initial scanning is ongoing.
+            pending_groups.setdefault(sid, {})[key] = (peer, name)
+            return True
+        groups = cached["groups"]
+        for i, (existing, _old_name) in enumerate(groups):
+            if _group_peer_key(existing) == key:
+                groups[i] = (peer, name)
+                return False
+        groups.append((peer, name))
+        stats.cached_group_count[sid] = len(groups)
+        log.info("Auto-detected group on session %s: %s", sid, name)
+        return True
+
+
+async def forget_left_group(sid: str, entity):
+    """Remove the account's departed group so it is not sent to next round."""
+    peer = await _input_peer(entity)
+    key = _group_peer_key(peer)
+    lock = scan_locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        pending_groups.get(sid, {}).pop(key, None)
+        cached = target_cache.get(sid)
+        if cached is not None:
+            groups = cached["groups"]
+            groups[:] = [(p, n) for p, n in groups if _group_peer_key(p) != key]
+            stats.cached_group_count[sid] = len(groups)
+
+
+async def handle_group_join_event(event, sid: str, my_id: int):
+    """A self join/add/removal event only changes its own session cache."""
+    if not (getattr(event, "is_group", False) or getattr(event, "is_channel", False)):
+        return
+    user_ids = getattr(event, "user_ids", None) or []
+    if getattr(event, "user_id", None) is not None:
+        user_ids = list(user_ids) + [event.user_id]
+    if my_id not in user_ids:
+        return  # Someone else joined; do not add unrelated targets.
+    try:
+        entity = await event.get_chat()
+        if getattr(event, "user_joined", False) or getattr(event, "user_added", False):
+            await cache_joined_group(sid, entity, getattr(entity, "title", None) or str(event.chat_id))
+        elif getattr(event, "user_left", False) or getattr(event, "user_kicked", False):
+            await forget_left_group(sid, entity)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.debug("Could not update joined group cache for %s: %s", sid, type(exc).__name__)
+
+
+async def remember_group_from_event(event, sid: str):
+    """Discover new groups from incoming group activity without dialog scans."""
+    try:
+        entity = await event.get_chat()
+        if entity is not None:
+            await cache_joined_group(sid, entity, getattr(entity, "title", None) or str(event.chat_id))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.debug("Group message cache update failed on %s: %s", sid, type(exc).__name__)
 
 
 async def scan_targets(client: TelegramClient):
@@ -574,6 +827,13 @@ async def get_cached_targets(row: dict, client: TelegramClient, force: bool = Fa
         if cached and not force and now - cached["scanned_at"] < TARGET_CACHE_TTL:
             return cached["groups"], cached["users"], False
         groups, users = await scan_targets(client)
+        # Keep join events that arrived during the dialogs API call; prefer
+        # live entities where they offer a fresher access_hash or title.
+        merged = {_group_peer_key(peer): (peer, name) for peer, name in groups}
+        merged.update(pending_groups.pop(sid, {}))
+        # A full scan is authoritative for existing groups; live events are
+        # serialized by scan_locks and pending new joins are merged above.
+        groups = list(merged.values())
         target_cache[sid] = {"groups": groups, "users": users, "scanned_at": now}
         stats.cached_group_count[row["id"]] = len(groups)
         stats.cached_user_count[row["id"]] = len(users)
@@ -649,12 +909,12 @@ def pick_post(posts: list[dict], mode: str, index: int, round_number: int = 1, p
     return posts[(index + round_number - 1) % len(posts)]
 
 
-async def _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock):
+async def _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metric):
     """Independent account worker; sequential, paced group sends and no immediate flood retries."""
     targets = [("group", e, n) for e, n in groups] + [("user", e, n) for e, n in users]
     sid = str(row["id"])
-    last_edit = 0.0
     delay = stats.group_delay_seconds
+    metric["status"] = "Running"
     try:
         for target_index, (target_type, entity, name) in enumerate(targets):
             if not stats.running:
@@ -668,6 +928,8 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 last_random_post_by_target[target_key] = post["id"]
             stats.current_post = f"#{post['id']}"
             stop_this_account = False
+            outcome, error = "sent", ""
+            metric["target"] = f"{target_type}: {name}"
             try:
                 # A single pacing lock is shared with this account's incoming DM auto-reply.
                 await pacer.run(
@@ -680,6 +942,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 else:
                     stats.user_sent += 1
             except AccountPausedError as e:
+                outcome, error = "skipped", f"Account paused {e.remaining}s"
                 stats.skipped += 1
                 if target_type == "group":
                     stats.group_skipped += 1
@@ -689,11 +952,17 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 stats.last_error = f"{row['label']}: account cooling down ({e.remaining}s left)"
                 stop_this_account = True
             except errors.SlowModeWaitError as e:
+                outcome, error = "skipped", f"Chat slow mode {e.seconds}s"
                 # Slow mode is a chat-level restriction; skip this chat for this round.
                 stats.skipped += 1
-                stats.group_skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
                 stats.last_error = f"{row['label']}: {name} has slow mode ({e.seconds}s)"
             except errors.FloodWaitError as e:
+                outcome, error = "skipped", f"FloodWait {e.seconds}s"
+                metric["flood_waits"] += 1
                 # Do not immediately retry the same target after FloodWait. Respect
                 # Telegram's stated cooldown, persist it, and stop this account's round.
                 stats.flood_waits += 1
@@ -708,6 +977,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 stats.paused_sessions += 1
                 stop_this_account = True
             except errors.PeerFloodError:
+                outcome, error = "skipped", "Account restricted (PeerFlood)"
                 # PeerFlood indicates an account-level anti-spam restriction.
                 # Delays cannot lift that restriction; pause this account.
                 await pause_account(sid, RESTRICTION_PAUSE_HOURS * 3600,
@@ -722,6 +992,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 stop_this_account = True
             except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError,
                     errors.ChatAdminRequiredError):
+                outcome, error = "skipped", "Writing not permitted"
                 stats.skipped += 1
                 if target_type == "group":
                     stats.group_skipped += 1
@@ -729,6 +1000,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                     stats.user_skipped += 1
                 stats.last_error = f"{row['label']}: write not allowed: {name}"
             except Exception as e:
+                outcome, error = "failed", type(e).__name__
                 stats.failed += 1
                 if target_type == "group":
                     stats.group_failed += 1
@@ -736,27 +1008,22 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                     stats.user_failed += 1
                 stats.last_error = f"{row['label']}: {type(e).__name__}: {e}"
             finally:
+                await record_account_event(row, metric, target_type, name, outcome, error)
                 stats.attempted += 1
                 if target_type == "group":
                     stats.group_attempted += 1
                 else:
                     stats.user_attempted += 1
 
-            now = time.time()
-            if progress_msg and (now - last_edit >= 3 or stop_this_account):
-                async with edit_lock:
-                    try:
-                        await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
-                    except Exception:
-                        pass
-                last_edit = now
+            await edit_account_progress(row, metric, force=stop_this_account)
             if stop_this_account:
                 break
             # No explicit sleep here: AccountPacer enforces the minimum gap
             # between completed sends, including interleaved DM auto-replies.
     finally:
-        # Persistent shared client continues receiving DMs during and after the round.
-        pass
+        metric["status"] = "Stopped" if not stats.running else "Finished"
+        metric["target"] = "-"
+        await edit_account_progress(row, metric, force=True)
 
 
 async def do_round(app: Application):
@@ -822,8 +1089,17 @@ async def do_round(app: Application):
         pass
 
     edit_lock = asyncio.Lock()
-    # All sessions run simultaneously; each individual session sends sequentially.
-    await asyncio.gather(*(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock)
+    metrics = {}
+    for row, client, groups, users in prepared:
+        metric = begin_metric(row, 'promo', len(groups)+len(users), len(groups), len(users))
+        metrics[str(row['id'])] = metric
+        try:
+            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
+            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
+        except Exception:
+            pass
+    # Accounts are scheduled concurrently. Every account has its own live status.
+    await asyncio.gather(*(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metrics[str(row['id'])])
                            for row, client, groups, users in prepared))
 
     if progress_msg:
@@ -895,10 +1171,20 @@ async def run_one_time_dm_broadcast(app: Application):
         pass
 
     edit_lock = asyncio.Lock()
+    metrics = {}
+    for row, client, users in prepared:
+        metric = begin_metric(row, 'dm', len(users), users=len(users))
+        metrics[str(row['id'])] = metric
+        try:
+            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
+            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'dm')] = message
+        except Exception:
+            pass
 
     async def worker(row, client, users):
         sid = str(row["id"])
-        last_edit = 0.0
+        metric = metrics[sid]
+        metric["status"] = "Running"
         try:
             remaining = await get_pause_remaining(sid)
             if remaining:
@@ -911,18 +1197,23 @@ async def run_one_time_dm_broadcast(app: Application):
                 post = pick_post(posts, mode, target_index, stats.round_no)
                 stats.current_post = f"#{post['id']}"
                 stop_this_account = False
+                outcome, error = "sent", ""
+                metric["target"] = f"DM: {name}"
                 try:
                     await pacer.run(sid, DM_BROADCAST_DELAY_SECONDS,
                                     lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)))
                     stats.sent += 1
                     stats.user_sent += 1
                 except AccountPausedError as e:
+                    outcome, error = "skipped", f"Account paused {e.remaining}s"
                     stats.skipped += 1
                     stats.user_skipped += 1
                     stats.paused_sessions += 1
                     stats.last_error = f"{row['label']}: account cooling down ({e.remaining}s left)"
                     stop_this_account = True
                 except errors.FloodWaitError as e:
+                    outcome, error = "skipped", f"FloodWait {e.seconds}s"
+                    metric["flood_waits"] += 1
                     stats.flood_waits += 1
                     stats.skipped += 1
                     stats.user_skipped += 1
@@ -932,6 +1223,7 @@ async def run_one_time_dm_broadcast(app: Application):
                     stats.paused_sessions += 1
                     stop_this_account = True
                 except errors.PeerFloodError:
+                    outcome, error = "skipped", "Account restricted (PeerFlood)"
                     await pause_account(sid, RESTRICTION_PAUSE_HOURS * 3600,
                                         "Telegram account restriction (PeerFlood)")
                     stats.skipped += 1
@@ -940,26 +1232,21 @@ async def run_one_time_dm_broadcast(app: Application):
                     stats.last_error = f"{row['label']}: account restricted; manual DM stopped"
                     stop_this_account = True
                 except Exception as e:
+                    outcome, error = "failed", type(e).__name__
                     stats.failed += 1
                     stats.user_failed += 1
                     stats.last_error = f"{row['label']}: {type(e).__name__}: {e}"
                 finally:
+                    await record_account_event(row, metric, "user", name, outcome, error)
                     stats.attempted += 1
                     stats.user_attempted += 1
-                now = time.time()
-                if progress_msg and (now - last_edit >= 3 or stop_this_account):
-                    async with edit_lock:
-                        try:
-                            await progress_msg.edit_text("📨 <b>DM BROADCAST</b>\n\n" + stats_text(),
-                                                         parse_mode=ParseMode.HTML)
-                        except Exception:
-                            pass
-                    last_edit = now
+                await edit_account_progress(row, metric, force=stop_this_account)
                 if stop_this_account:
                     break
         finally:
-            # Keep listening for incoming DMs after the manual broadcast.
-            pass
+            metric["status"] = "Finished"
+            metric["target"] = "-"
+            await edit_account_progress(row, metric, force=True)
 
     await asyncio.gather(*(worker(row, client, users) for row, client, users in prepared))
     stats.current_group = "-"
@@ -1101,6 +1388,7 @@ def account_reply_handler(session_key: str):
 async def account_auto_reply_service(app: Application):
     """Keep one Telegram connection per enabled account, shared by all workloads."""
     my_session_ids = set()
+    last_sync: dict[str, float] = {}
     try:
         while True:
             try:
@@ -1113,9 +1401,18 @@ async def account_auto_reply_service(app: Application):
                         if not stats.running and not broadcast_running(app):
                             await close_account_client(sid)
                             my_session_ids.discard(sid)
+                            last_sync.pop(sid, None)
                 for sid, row in enabled.items():
                     try:
-                        await get_account_client(row)
+                        client = await get_account_client(row)
+                        # Self-join events usually arrive immediately. This
+                        # periodic catch-up handles missed updates/reconnects
+                        # without requiring the Rescan Targets menu button.
+                        now = time.monotonic()
+                        if now - last_sync.get(sid, 0) >= AUTO_GROUP_SYNC_SECONDS:
+                            first_sync = sid not in last_sync
+                            last_sync[sid] = now
+                            await get_cached_targets(row, client, force=not first_sync)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -1672,7 +1969,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         stats.running = True
         PROMO_TASKS[uid] = asyncio.create_task(scheduler(context.application), name=f"promo_scheduler_{uid}")
-        await update.message.reply_text("▶️ Promotion started. Use 📊 Live Stats to check progress.", reply_markup=MENU)
+        await update.message.reply_text("▶️ Promotion started. Accounts run concurrently. Each account gets its own progress message; use 📊 Account Stats and 📜 Account Logs.", reply_markup=MENU)
 
     elif text == "⏹ Stop Promo":
         stats.running = False
@@ -1698,10 +1995,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await session_store.get_sessions(enabled_only=True):
             await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
-        await update.message.reply_text("📨 One-time broadcast to existing private DM dialogs started. Use 📊 Live Stats for progress.", reply_markup=MENU)
+        await update.message.reply_text("📨 Manual DM broadcast started. Each account gets its own progress message. See 📊 Account Stats or 📜 Account Logs.", reply_markup=MENU)
         set_broadcast_running(context.application, True)
         set_broadcast_task(context.application, asyncio.create_task(
             dm_broadcast_runner(context.application), name=f"one_time_dm_broadcast_{uid}"))
+
+    elif text == "📊 Account Stats":
+        await send_account_telemetry(update, 'stats')
+
+    elif text == "📜 Account Logs":
+        await send_account_telemetry(update, 'logs')
 
     elif text == "📊 Live Stats":
         stats.active_posts = len(await db.list_posts(enabled_only=True))

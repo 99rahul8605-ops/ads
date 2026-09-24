@@ -245,3 +245,56 @@ same to decrypt the owner and operator accounts.
 Optional `.env` setting: `OPERATORS_DIR=operators` controls the per-operator
 SQLite/media directory. Operator data is local to your deployment; back up
 `operators/` along with `promo.db`, `media/` and MongoDB.
+
+
+## Automatic new-group detection
+
+Each connected account watches Telegram join/add events and incoming group activity. When
+that account joins a new group or supergroup, its own cached group target list is updated
+automatically; other operators' accounts and groups are not affected. A self-leave event
+removes the departed group. A new group found during an active promotion becomes eligible
+for the **next promotion round** (the currently executing round uses a snapshot).
+
+Telegram does not consistently deliver self-join events for every channel or reconnect.
+A background reconciliation of that account's joined-group dialogs runs approximately every
+10 minutes by default, controlled by `AUTO_GROUP_SYNC_SECONDS=600` (minimum 300). This
+means no manual `🔄 Rescan Targets` is necessary in ordinary use. The button remains for
+optional immediate manual correction. Only groups/supergroups are promotion targets;
+broadcast-only channels and private chats are not added to recurring promotions.
+
+Accounts still obey the configured per-group delay and Telegram FloodWait/anti-spam pauses.
+Automatic discovery does not guarantee the account has permission to post in a new group.
+
+## Per-account progress, statistics and logs
+
+All enabled sessions start their group-promotion workers **concurrently**. Inside each
+Telegram account, group messages remain sequential and respect that account's
+configured minimum gap and any Telegram FloodWait. Two different Telegram
+accounts do not wait for each other's per-account pacing lock. Incoming private
+replies may take priority on the same account, without bypassing cooldowns.
+
+On **Start Promo**, each account receives its own editable progress message in
+the operator's control-bot chat. Its status shows sent, failed, skipped, total
+and the last attempted group. Manual **DM Broadcast** uses separately tracked
+per-account metrics, so it does not overwrite promotion history. The combined
+**📊 Live Stats** remains available; use **📊 Account Stats** for individual
+accounts and **📜 Account Logs** to retrieve recent send results for each
+account and mode.
+
+The two types of logs are persisted independently:
+
+- Owner: `logs/<mongo-session-id>-promo.log` and `logs/<mongo-session-id>-dm.log`
+- Operator: `operators/<operator-uid>/logs/<mongo-session-id>-promo.log` and
+  `operators/<operator-uid>/logs/<mongo-session-id>-dm.log`
+
+Logs contain timestamps, target names, send outcomes and a brief error type,
+not the encrypted Telegram session. The bot shows the latest ten entries per
+account and mode. The latest per-account counters are in memory since the
+last restart; durable log files remain available after restarting.
+
+**Why a group can see a 30–60-minute gap:** A 30-second gap across 60 groups
+requires *at least* 30 minutes for one account's round. The separately configured
+repeat interval starts **after** the round finishes, so a 30-minute interval
+can result in at least 60 minutes between two posts in the same group. Setting
+the gap too low can trigger Telegram rate limits; the bot does not bypass
+FloodWait or account restrictions. See `.env.example` for pacing settings.
