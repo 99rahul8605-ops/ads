@@ -194,13 +194,19 @@ async def reply_panel_text() -> str:
     bot = await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED)
     saved_post = await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST)
     cooldown = await reply_cooldown()
+    tenant_session_ids = {str(row["id"]) for row in await session_store.get_sessions()}
+    connected_listeners = sum(
+        client.is_connected()
+        for session_id, client in _account_dm_clients.items()
+        if session_id in tenant_session_ids
+    )
     return (
         "💬 <b>AUTO REPLY SETTINGS</b>\n\n"
         f"👤 Connected real IDs: <b>{'ON' if acc else 'OFF'}</b>\n"
         f"🤖 Control bot: <b>{'ON' if bot else 'OFF'}</b>\n"
         f"📝 Real-ID reply mode: <b>{'Saved promo post' if saved_post else 'Custom text'}</b>\n"
         f"⏱ Cooldown: <b>{cooldown // 60} min</b>\n\n"
-        f"📡 Real-ID listeners connected: <b>{sum(c.is_connected() for sid, c in _account_dm_clients.items() if sid in {str(row["id"]) for row in await session_store.get_sessions()})}</b>\n"
+        f"📡 Real-ID listeners connected: <b>{connected_listeners}</b>\n"
         f"✅ Account replies sent since restart: <b>{_reply_sent_counts['accounts']}</b>\n\n"
         "Choose a button to edit. Changes apply without restart."
     )
