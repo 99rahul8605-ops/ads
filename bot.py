@@ -676,6 +676,41 @@ async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramCli
     return client
 
 
+async def _register_validated_session(client: TelegramClient, me, session_string: str):
+    """Atomically save and adopt a freshly validated/login client.
+
+    The account lock is acquired *before* MongoDB marks the session active. This
+    prevents the background listener from seeing the fresh row and creating a
+    second Telethon client while the validation/login client is still connected.
+    """
+    account_key = str(me.id)
+    lock = _account_client_locks.setdefault(account_key, asyncio.Lock())
+    async with lock:
+        # Remove any older pooled connection for this Telegram account without
+        # calling close_account_client() (which would try to acquire this lock again).
+        old = _account_dm_clients.pop(account_key, None)
+        if old is not None and old is not client:
+            try:
+                await old.disconnect()
+            except Exception:
+                pass
+
+        label = f"{me.first_name or 'Account'} ({me.id})"
+        enc = fernet.encrypt(session_string.encode()).decode()
+        stored_sid = await session_store.add_session(
+            label, enc, me.id, me.username, me.first_name
+        )
+        rows = await session_store.get_sessions(enabled_only=False)
+        stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
+        if stored_row is None:
+            raise RuntimeError("Session was saved but could not be loaded from MongoDB")
+
+        # Still under the same account lock: background get_account_client() calls
+        # for this account cannot create another client until adoption is complete.
+        shared = await _adopt_shared_client(stored_row, client)
+        return label, stored_sid, stored_row, shared
+
+
 async def get_account_client(row: dict) -> TelegramClient:
     """Return exactly one long-lived Telethon client for this Telegram account."""
     sid = str(row["id"])
@@ -1829,15 +1864,9 @@ async def save_logged_in_client(client: TelegramClient):
     session_string = client.session.save()
     if not session_string:
         raise RuntimeError("Could not export StringSession")
-    label = f"{me.first_name or 'Account'} ({me.id})"
-    enc = fernet.encrypt(session_string.encode()).decode()
-    stored_sid = await session_store.add_session(label, enc, me.id, me.username, me.first_name)
-    await close_account_client(str(me.id))
-    rows = await session_store.get_sessions(enabled_only=False)
-    stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
-    if stored_row is None:
-        raise RuntimeError("Session was saved but could not be loaded from MongoDB")
-    await _adopt_shared_client(stored_row, client)
+    label, stored_sid, _stored_row, _shared = await _register_validated_session(
+        client, me, session_string
+    )
     # Caller must not disconnect this client after successful adoption.
     return label, None, None, stored_sid
 
@@ -2052,20 +2081,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # runtime client. This prevents validation/listener overlap for one auth key.
             client = await make_client(session_string)
             me = await client.get_me()
-            label = f"{me.first_name or 'Account'} ({me.id})"
-            enc = fernet.encrypt(session_string.encode()).decode()
-            stored_sid = await session_store.add_session(
-                label, enc, me.id, me.username, me.first_name
+            label, stored_sid, _stored_row, shared = await _register_validated_session(
+                client, me, session_string
             )
-
-            # Close only any OLD pooled connection for this Telegram account.
-            await close_account_client(str(me.id))
-            rows = await session_store.get_sessions(enabled_only=False)
-            stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
-            if stored_row is None:
-                raise RuntimeError("Session was saved but could not be loaded from MongoDB")
-
-            shared = await _adopt_shared_client(stored_row, client)
             client = None  # ownership moved to shared pool; do not disconnect in finally
             connected = bool(shared and shared.is_connected())
             username = f"@{me.username}" if me.username else "—"
