@@ -188,16 +188,21 @@ async def reply_cooldown() -> int:
         return DM_REPLY_COOLDOWN_SECONDS
 
 
+def _client_key_from_row(row: dict) -> str:
+    tg_id = row.get("tg_user_id")
+    return str(tg_id if tg_id is not None else row["id"])
+
+
 async def reply_panel_text() -> str:
     acc = await reply_enabled("account_dm_enabled", ACCOUNT_DM_AUTO_REPLY_ENABLED)
     bot = await reply_enabled("control_bot_dm_enabled", DM_AUTO_REPLY_ENABLED)
     saved_post = await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST)
     cooldown = await reply_cooldown()
-    tenant_session_ids = {str(row["id"]) for row in await session_store.get_sessions()}
+    tenant_client_keys = {_client_key_from_row(row) for row in await session_store.get_sessions()}
     connected_listeners = sum(
         client.is_connected()
-        for session_id, client in _account_dm_clients.items()
-        if session_id in tenant_session_ids
+        for account_key, client in _account_dm_clients.items()
+        if account_key in tenant_client_keys
     )
     return (
         "💬 <b>AUTO REPLY SETTINGS</b>\n\n"
@@ -214,8 +219,10 @@ async def reply_panel_text() -> str:
 # A single persistent Telethon connection per account is shared by group promotion,
 # manual DM broadcasts and incoming-DM handlers. Separate simultaneous clients using
 # the same StringSession can compete for updates, making auto-replies unreliable.
+# One live Telethon connection per actual Telegram account ID.
 _account_dm_clients: dict[str, TelegramClient] = {}
 _account_client_locks: dict[str, asyncio.Lock] = {}
+_session_client_keys: dict[str, str] = {}
 _account_reply_timestamps: dict[tuple[str, int], float] = {}
 _account_reply_pending: set[tuple[str, int]] = set()
 _TENANT_REPLY_COUNTS: dict[int, dict[str, int]] = {}
@@ -616,26 +623,40 @@ async def make_client(session_string: str) -> TelegramClient:
 
 
 async def get_account_client(row: dict) -> TelegramClient:
-    """Get or create the one long-lived, event-enabled client for this account.
+    """Return the single long-lived Telethon client for this Telegram account.
 
-    The per-account lock prevents both the listener service and a broadcast
-    starting simultaneously from opening duplicate sessions.
+    Promotion, DM broadcast, auto-reply and group-update listeners all share it.
     """
     sid = str(row["id"])
-    lock = _account_client_locks.setdefault(sid, asyncio.Lock())
+    tg_id = row.get("tg_user_id")
+    account_key = str(tg_id if tg_id is not None else sid)
+    session_client_keys = globals().setdefault("_session_client_keys", {})
+    session_client_keys[sid] = account_key
+    lock = _account_client_locks.setdefault(account_key, asyncio.Lock())
     async with lock:
-        existing = _account_dm_clients.get(sid)
+        existing = _account_dm_clients.get(account_key)
         if existing and existing.is_connected():
             return existing
         if existing:
-            _account_dm_clients.pop(sid, None)
+            _account_dm_clients.pop(account_key, None)
             try:
                 await existing.disconnect()
             except Exception:
                 pass
-        client = await make_client(decrypt_session(row["session_enc"]))
-        # Register on the SAME client that broadcasts will use. The handler
-        # checks its enabled setting on every incoming message.
+        try:
+            client = await make_client(decrypt_session(row["session_enc"]))
+        except errors.AuthKeyDuplicatedError:
+            await session_store.mark_needs_relogin(
+                sid,
+                "AuthKeyDuplicatedError: create a fresh Telegram session for this account",
+            )
+            log.error(
+                "Session requires re-login for %s (%s): AuthKeyDuplicatedError",
+                row.get("label", sid),
+                row.get("tg_user_id", "?"),
+            )
+            raise
+
         owner = tenant_id()
         handler = account_reply_handler(sid)
         async def scoped_dm(event):
@@ -645,21 +666,16 @@ async def get_account_client(row: dict) -> TelegramClient:
             finally:
                 CURRENT_OPERATOR.reset(token)
         client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
-        # Discover joined groups on this account's own update stream. The
-        # operator context ensures there is no cross-user cache/stat leakage.
+
         me = await client.get_me()
         my_id = me.id
-
         async def scoped_group_join(event):
             token = CURRENT_OPERATOR.set(owner)
             try:
                 await handle_group_join_event(event, sid, my_id)
             finally:
                 CURRENT_OPERATOR.reset(token)
-
         async def scoped_group_message(event):
-            # Telegram sometimes supplies a channel update without a self-join
-            # ChatAction. The first message in the new group then repairs cache.
             if not getattr(event, "is_group", False):
                 return
             token = CURRENT_OPERATOR.set(owner)
@@ -667,21 +683,26 @@ async def get_account_client(row: dict) -> TelegramClient:
                 await remember_group_from_event(event, sid)
             finally:
                 CURRENT_OPERATOR.reset(token)
-
         client.add_event_handler(scoped_group_join, events.ChatAction())
         client.add_event_handler(scoped_group_message, events.NewMessage(incoming=True))
-        _account_dm_clients[sid] = client
-        log.info("Account DM listener ready for %s", row.get("label", sid))
+        _account_dm_clients[account_key] = client
+        log.info("Shared Telegram client ready for %s (%s)", row.get("label", sid), row.get("tg_user_id", account_key))
         return client
 
 
-async def close_account_client(sid: str):
-    sid = str(sid)
-    lock = _account_client_locks.setdefault(sid, asyncio.Lock())
+async def close_account_client(sid_or_account_key: str):
+    raw = str(sid_or_account_key)
+    account_key = _session_client_keys.pop(raw, raw)
+    lock = _account_client_locks.setdefault(account_key, asyncio.Lock())
     async with lock:
-        client = _account_dm_clients.pop(sid, None)
+        client = _account_dm_clients.pop(account_key, None)
         if client:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            finally:
+                for sid, key in list(_session_client_keys.items()):
+                    if key == account_key:
+                        _session_client_keys.pop(sid, None)
 
 
 def decrypt_session(value: str) -> str:
@@ -1556,6 +1577,14 @@ async def account_auto_reply_service(app: Application):
                             await get_cached_targets(row, client, force=not first_sync)
                     except asyncio.CancelledError:
                         raise
+                    except errors.AuthKeyDuplicatedError:
+                        my_session_ids.discard(sid)
+                        last_sync.pop(sid, None)
+                        log.error(
+                            "Account disabled until fresh login: %s (%s)",
+                            row.get("label", sid),
+                            row.get("tg_user_id", "?"),
+                        )
                     except Exception as e:
                         log.warning("Account listener unavailable for %s: %s",
                                     row.get("label", sid), type(e).__name__)
@@ -1665,7 +1694,9 @@ async def save_logged_in_client(client: TelegramClient):
         raise RuntimeError("Could not export StringSession")
     label = f"{me.first_name or 'Account'} ({me.id})"
     enc = fernet.encrypt(session_string.encode()).decode()
-    await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+    stored_sid = await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+    await close_account_client(str(me.id))
+    _session_client_keys[str(stored_sid)] = str(me.id)
     # Do not scan dialogs here. The cache is built on first Start or manual Rescan,
     # which avoids duplicate GetDialogsRequest bursts during account setup.
     return label, None, None
@@ -1879,7 +1910,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             me = await client.get_me()
             label = f"{me.first_name or 'Account'} ({me.id})"
             enc = fernet.encrypt(session_string.encode()).decode()
-            await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+            stored_sid = await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+            await close_account_client(str(me.id))
+            _session_client_keys[str(stored_sid)] = str(me.id)
             await msg.edit_text(
                 f"✅ Session added.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.",
                 parse_mode=ParseMode.HTML,

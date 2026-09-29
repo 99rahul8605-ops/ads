@@ -211,6 +211,8 @@ class MongoSessionStore:
                         "username": username,
                         "first_name": first_name,
                         "enabled": True,
+                        "auth_state": "active",
+                        "auth_error": None,
                         "updated_at": now,
                     },
                     "$setOnInsert": {"created_at": now},
@@ -232,15 +234,49 @@ class MongoSessionStore:
             "username": doc.get("username"),
             "first_name": doc.get("first_name"),
             "enabled": bool(doc.get("enabled", True)),
+            "auth_state": doc.get("auth_state", "active"),
+            "auth_error": doc.get("auth_error"),
         }
 
     async def get_sessions(self, enabled_only=False):
         def _get():
-            query = {"$and": [self._owner_filter(), {"enabled": True}]} if enabled_only else self._owner_filter()
+            if enabled_only:
+                query = {"$and": [
+                    self._owner_filter(),
+                    {"enabled": True},
+                    {"auth_state": {"$ne": "needs_relogin"}},
+                ]}
+            else:
+                query = self._owner_filter()
             docs = list(self.collection.find(query).sort("created_at", ASCENDING))
             return [self._serialize(d) for d in docs]
 
         return await asyncio.to_thread(_get)
+
+    async def mark_needs_relogin(self, session_id: str, error: str = "AuthKeyDuplicatedError"):
+        from bson import ObjectId
+        from bson.errors import InvalidId
+
+        def _mark():
+            try:
+                lookup = {"_id": ObjectId(session_id)}
+            except (InvalidId, TypeError):
+                if str(session_id).isdigit():
+                    lookup = {"tg_user_id": int(session_id)}
+                else:
+                    return 0
+            query = {"$and": [self._owner_filter(), lookup]}
+            result = self.collection.update_one(
+                query,
+                {"$set": {
+                    "auth_state": "needs_relogin",
+                    "auth_error": str(error),
+                    "auth_error_at": datetime.now(timezone.utc),
+                }},
+            )
+            return result.modified_count
+
+        return await asyncio.to_thread(_mark)
 
     async def delete_session(self, session_id: str):
         from bson import ObjectId
