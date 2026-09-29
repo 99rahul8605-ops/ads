@@ -1175,7 +1175,12 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
     finally:
         metric["status"] = "Stopped" if not stats.running else "Finished"
         metric["target"] = "-"
-        await edit_account_progress(row, metric, force=True)
+        try:
+            await edit_account_progress(row, metric, force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Final account progress update failed for %s: %s", row.get("label", sid), type(exc).__name__)
 
 
 async def do_round(app: Application):
@@ -1293,11 +1298,57 @@ async def do_round(app: Application):
         await _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metric)
 
     # Normal and cooling-down accounts have independent concurrent workers.
-    await asyncio.gather(
-        *(_run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metrics[str(row['id'])])
+    # One account finishing or crashing must never stop the other accounts.
+    async def isolated_worker(row, client, groups, users):
+        sid = str(row["id"])
+        metric = metrics[sid]
+        try:
+            await _run_session_round(
+                row, client, groups, users, posts, mode, progress_msg, edit_lock, metric
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            metric["status"] = "Worker error"
+            metric["last_error"] = f"{type(exc).__name__}: {exc}"
+            stats.failed += 1
+            stats.last_error = f"{row['label']}: worker {type(exc).__name__}: {exc}"
+            await log_account_state(row, metric, "WORKER_ERROR", metric["last_error"])
+            try:
+                await edit_account_progress(row, metric, force=True)
+            except Exception:
+                pass
+
+    async def isolated_resume(row):
+        try:
+            await resume_prepaused(row)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            sid = str(row["id"])
+            metric = metrics.get(sid) or begin_metric(row, 'promo')
+            metrics[sid] = metric
+            metric["status"] = "Resume error"
+            metric["last_error"] = f"{type(exc).__name__}: {exc}"
+            stats.failed += 1
+            stats.last_error = f"{row['label']}: resume {type(exc).__name__}: {exc}"
+            await log_account_state(row, metric, "RESUME_ERROR", metric["last_error"])
+            try:
+                await edit_account_progress(row, metric, force=True)
+            except Exception:
+                pass
+
+    worker_results = await asyncio.gather(
+        *(isolated_worker(row, client, groups, users)
           for row, client, groups, users in prepared),
-        *(resume_prepaused(row) for row in initially_paused),
+        *(isolated_resume(row) for row in initially_paused),
+        return_exceptions=True,
     )
+    # CancelledError should still stop the scheduler; ordinary account errors are
+    # already contained and logged by the wrappers above.
+    for result in worker_results:
+        if isinstance(result, asyncio.CancelledError):
+            raise result
 
     if progress_msg:
         try:
