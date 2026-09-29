@@ -2234,7 +2234,18 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gcount = stats.cached_group_count.get(r["id"], "?")
             ucount = stats.cached_user_count.get(r["id"], "?")
             uname = f"@{r['username']}" if r.get("username") else "no username"
-            lines.append(f"#{r['id']} • {esc(r['first_name'] or r['label'])} • {esc(uname)} • groups: {gcount} • users: {ucount}")
+            auth_state = r.get("auth_state", "active")
+            enabled = bool(r.get("enabled", True))
+            if not enabled:
+                status = "⚪ DISABLED"
+            elif auth_state == "needs_relogin":
+                status = "🔐 NEEDS RELOGIN"
+            else:
+                status = "🟢 ACTIVE"
+            lines.append(
+                f"#{r['id']} • {esc(r['first_name'] or r['label'])} • {esc(uname)}\n"
+                f"{status} • groups: {gcount} • users: {ucount}"
+            )
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
 
     elif text == "🗑 Remove Session":
@@ -2310,8 +2321,28 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await db.get_post():
             await update.message.reply_text("❌ Save a promotion post first.", reply_markup=MENU)
             return
-        if not await session_store.get_sessions(enabled_only=True):
-            await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
+        active_sessions = await session_store.get_sessions(enabled_only=True)
+        if not active_sessions:
+            all_sessions = await session_store.get_sessions(enabled_only=False)
+            if all_sessions:
+                relogin_count = sum(1 for r in all_sessions if r.get("auth_state") == "needs_relogin")
+                disabled_count = sum(1 for r in all_sessions if not r.get("enabled", True))
+                details = []
+                if relogin_count:
+                    details.append(f"🔐 Needs relogin: <b>{relogin_count}</b>")
+                if disabled_count:
+                    details.append(f"⚪ Disabled: <b>{disabled_count}</b>")
+                detail_text = "\n".join(details) or "No session is currently usable."
+                await update.message.reply_text(
+                    "❌ <b>No active session available for promotion.</b>\n\n"
+                    f"Stored sessions: <b>{len(all_sessions)}</b>\n"
+                    f"{detail_text}\n\n"
+                    "Open <b>👤 Sessions</b> to see each account status. Re-add only accounts marked <b>NEEDS RELOGIN</b>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=MENU,
+                )
+            else:
+                await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
         stats.running = True
         PROMO_TASKS[uid] = asyncio.create_task(scheduler(context.application), name=f"promo_scheduler_{uid}")
