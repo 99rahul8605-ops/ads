@@ -35,7 +35,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-DB_PATH = os.getenv("DB_PATH", "promo.db")
 MONGO_URI = os.environ["MONGO_URI"]
 MONGO_DB = os.getenv("MONGO_DB", "promo_bot")
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
@@ -95,8 +94,8 @@ log = logging.getLogger("promo-bot")
 
 pacer = AccountPacer()
 # Tenant-aware proxies are initialized below, after RuntimeStats is declared.
-# Operator data is stored independently in operators/<uid>/promo.db, media/ and
-# MongoDB sessions tagged with owner_id. Legacy owner sessions remain accessible.
+# Operator data is tenant-isolated in MongoDB; downloaded media remains on disk.
+# Legacy owner sessions remain accessible through the Mongo session store.
 
 MENU = ReplyKeyboardMarkup(
     [
@@ -270,7 +269,7 @@ class RuntimeStats:
     cached_user_count: dict = field(default_factory=dict)
 
 # The current operator is bound to each bot update and inherited by background
-# tasks. The owner retains the original DB_PATH, MEDIA_DIR and legacy sessions.
+# tasks. Persistent tenant settings/posts/sessions are isolated by owner_id in MongoDB.
 CURRENT_OPERATOR = contextvars.ContextVar("operator", default=ADMIN_ID)
 APPROVED_USERS: set[int] = {ADMIN_ID}
 TENANT_DB: dict[int, Database] = {}
@@ -425,8 +424,7 @@ def tenant_id() -> int:
 
 def tenant_db(uid: int) -> Database:
     if uid not in TENANT_DB:
-        path = DB_PATH if uid == ADMIN_ID else str(OPERATORS_DIR / str(uid) / "promo.db")
-        TENANT_DB[uid] = Database(path)
+        TENANT_DB[uid] = Database(MONGO_URI, MONGO_DB, owner_id=uid)
     return TENANT_DB[uid]
 
 def tenant_sessions(uid: int) -> MongoSessionStore:
@@ -808,9 +806,33 @@ async def scan_targets(client: TelegramClient):
     return groups, []
 
 
+async def _has_prior_outgoing_dm(client: TelegramClient, entity, me) -> bool:
+    """True only when this connected account has previously messaged the user.
+
+    This deliberately excludes contact-only entries and incoming-only conversations,
+    so the manual DM broadcast never opens a brand-new private conversation.
+    """
+    try:
+        async for message in client.iter_messages(entity, from_user=me, limit=1):
+            if message is not None and getattr(message, "out", True):
+                return True
+        return False
+    except errors.FloodWaitError:
+        raise
+    except Exception as exc:
+        log.debug("Prior-DM history check failed for %s: %s", getattr(entity, "id", "?"), type(exc).__name__)
+        return False
+
+
 async def scan_existing_dm_users(client: TelegramClient):
-    """Return existing private user dialogs with one GetDialogs traversal."""
+    """Return private users that this account has already messaged before.
+
+    Contacts/non-contacts are treated the same. A user is eligible only if a private
+    dialog exists and Telegram history contains at least one outgoing message from
+    this connected account. Duplicate user IDs are removed.
+    """
     users = []
+    seen_ids = set()
     me = await client.get_me()
     async for dialog in client.iter_dialogs(limit=None):
         entity = dialog.entity
@@ -818,6 +840,11 @@ async def scan_existing_dm_users(client: TelegramClient):
             continue
         if entity.id == me.id or getattr(entity, "bot", False) or getattr(entity, "deleted", False):
             continue
+        if entity.id in seen_ids:
+            continue
+        if not await _has_prior_outgoing_dm(client, entity, me):
+            continue
+        seen_ids.add(entity.id)
         display = " ".join(x for x in [getattr(entity, "first_name", None), getattr(entity, "last_name", None)] if x)
         users.append((await _input_peer(entity), display or getattr(entity, "username", None) or str(entity.id)))
     return users
@@ -1216,7 +1243,7 @@ async def do_round(app: Application):
 
 
 async def run_one_time_dm_broadcast(app: Application):
-    """Manual one-time DM send to previously initiated private dialogs."""
+    """Manual one-time DM send only to users this account has messaged before."""
     sessions = await session_store.get_sessions(enabled_only=True)
     posts = await db.list_posts(enabled_only=True)
     mode = await db.get_setting("post_mode", "rotate")
@@ -1616,7 +1643,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return await bot_dm_auto_reply(update, context)
     await update.message.reply_text(
-        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are cached so every promo round does not rescan dialogs. Recurring scheduler targets joined groups only. Use 📨 DM Broadcast for a one-time send to existing private dialogs.",
+        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are cached so every promo round does not rescan dialogs. Recurring scheduler targets joined groups only. Use 📨 DM Broadcast for a one-time send only to private users this account has already messaged before.",
         parse_mode=ParseMode.HTML,
         reply_markup=MENU,
     )

@@ -1,158 +1,168 @@
 import asyncio
+import random
 from datetime import datetime, timezone
-from pathlib import Path
 
-import aiosqlite
-from pymongo import ASCENDING, MongoClient
-from pymongo.errors import PyMongoError
-
-SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS promo_post (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    kind TEXT NOT NULL,
-    html_text TEXT,
-    media_path TEXT,
-    media_type TEXT,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS promo_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,
-    html_text TEXT,
-    media_path TEXT,
-    media_type TEXT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-"""
+from pymongo import ASCENDING, MongoClient, ReturnDocument
 
 
 class Database:
-    """SQLite store for settings and a library of promotion posts."""
+    """MongoDB-backed tenant settings and promotion-post storage.
 
-    def __init__(self, path: str):
-        self.path = path
+    The public async API intentionally matches the former SQLite Database class
+    so the rest of the bot does not need to know which storage engine is used.
+    Every document is scoped by owner_id, keeping approved operators isolated.
+    """
+
+    def __init__(self, uri: str, db_name: str, owner_id: int):
+        self.uri = uri
+        self.db_name = db_name
+        self.owner_id = int(owner_id)
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        mongo_db = self.client[db_name]
+        self.settings = mongo_db["tenant_settings"]
+        self.posts = mongo_db["promo_posts"]
+        self.counters = mongo_db["tenant_counters"]
 
     async def init(self):
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.path) as db:
-            await db.executescript(SQLITE_SCHEMA)
-            # One-time migration; deleting every post must not restore the legacy post.
-            cur = await db.execute("SELECT value FROM settings WHERE key='posts_migrated_v1'")
-            if not await cur.fetchone():
-                await db.execute(
-                    """INSERT INTO promo_posts (kind,html_text,media_path,media_type,enabled)
-                       SELECT kind,html_text,media_path,media_type,1
-                       FROM promo_post WHERE id=1
-                         AND NOT EXISTS (SELECT 1 FROM promo_posts)"""
+        def _init():
+            self.client.admin.command("ping")
+            self.settings.create_index([("owner_id", ASCENDING), ("key", ASCENDING)], unique=True)
+            self.posts.create_index([("owner_id", ASCENDING), ("id", ASCENDING)], unique=True)
+            self.posts.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING), ("id", ASCENDING)])
+            # Keep the post counter at least as high as the largest existing id.
+            last = self.posts.find_one({"owner_id": self.owner_id}, sort=[("id", -1)], projection={"id": 1})
+            max_id = int(last.get("id", 0)) if last else 0
+            if max_id:
+                self.counters.update_one(
+                    {"_id": f"post:{self.owner_id}"},
+                    {"$max": {"seq": max_id}},
+                    upsert=True,
                 )
-                await db.execute(
-                    "INSERT INTO settings(key,value) VALUES('posts_migrated_v1','1')"
-                )
-            await db.commit()
+        await asyncio.to_thread(_init)
 
     async def set_setting(self, key: str, value: str):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
-            await db.commit()
+        now = datetime.now(timezone.utc)
+        await asyncio.to_thread(
+            self.settings.update_one,
+            {"owner_id": self.owner_id, "key": key},
+            {"$set": {"value": str(value), "updated_at": now},
+             "$setOnInsert": {"created_at": now}},
+            True,
+        )
 
     async def get_setting(self, key: str, default=None):
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
-            row = await cur.fetchone()
-            return row[0] if row else default
+        def _get():
+            doc = self.settings.find_one({"owner_id": self.owner_id, "key": key}, {"value": 1})
+            return doc.get("value") if doc else default
+        return await asyncio.to_thread(_get)
 
     async def add_post(self, kind, html_text, media_path=None, media_type=None):
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "INSERT INTO promo_posts(kind,html_text,media_path,media_type,enabled) VALUES(?,?,?,?,1)",
-                (kind, html_text, media_path, media_type),
+        now = datetime.now(timezone.utc)
+        def _add():
+            counter = self.counters.find_one_and_update(
+                {"_id": f"post:{self.owner_id}"},
+                {"$inc": {"seq": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
             )
-            await conn.commit()
-            return cur.lastrowid
+            post_id = int(counter["seq"])
+            self.posts.insert_one({
+                "owner_id": self.owner_id,
+                "id": post_id,
+                "kind": kind,
+                "html_text": html_text,
+                "media_path": media_path,
+                "media_type": media_type,
+                "enabled": True,
+                "created_at": now,
+            })
+            return post_id
+        return await asyncio.to_thread(_add)
+
+    @staticmethod
+    def _serialize_post(doc):
+        if not doc:
+            return None
+        return {
+            "id": int(doc["id"]),
+            "kind": doc.get("kind"),
+            "html_text": doc.get("html_text"),
+            "media_path": doc.get("media_path"),
+            "media_type": doc.get("media_type"),
+            "enabled": 1 if doc.get("enabled", True) else 0,
+            "created_at": doc.get("created_at"),
+        }
 
     async def list_posts(self, enabled_only=False):
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            query = "SELECT * FROM promo_posts"
+        def _list():
+            q = {"owner_id": self.owner_id}
             if enabled_only:
-                query += " WHERE enabled=1"
-            query += " ORDER BY id ASC"
-            cur = await conn.execute(query)
-            return [dict(row) for row in await cur.fetchall()]
+                q["enabled"] = True
+            return [self._serialize_post(d) for d in self.posts.find(q).sort("id", ASCENDING)]
+        return await asyncio.to_thread(_list)
 
     async def get_post_by_id(self, post_id):
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
-            row = await cur.fetchone()
-            return dict(row) if row else None
+        def _get():
+            return self._serialize_post(self.posts.find_one({"owner_id": self.owner_id, "id": int(post_id)}))
+        return await asyncio.to_thread(_get)
 
     async def get_post(self):
-        """Compatibility helper for older callers; first enabled post."""
         posts = await self.list_posts(enabled_only=True)
         return posts[0] if posts else None
 
     async def delete_post(self, post_id):
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
-            row = await cur.fetchone()
-            if not row:
-                return None
-            await conn.execute("DELETE FROM promo_posts WHERE id=?", (post_id,))
-            await conn.commit()
-            return dict(row)
+        def _delete():
+            return self._serialize_post(self.posts.find_one_and_delete({"owner_id": self.owner_id, "id": int(post_id)}))
+        return await asyncio.to_thread(_delete)
 
     async def toggle_post(self, post_id):
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM promo_posts WHERE id=?", (post_id,))
-            row = await cur.fetchone()
-            if not row:
+        def _toggle():
+            q = {"owner_id": self.owner_id, "id": int(post_id)}
+            doc = self.posts.find_one(q, {"enabled": 1})
+            if not doc:
                 return None
-            new_enabled = 0 if row["enabled"] else 1
-            await conn.execute("UPDATE promo_posts SET enabled=? WHERE id=?", (new_enabled, post_id))
-            await conn.commit()
-            return bool(new_enabled)
+            new_enabled = not bool(doc.get("enabled", True))
+            self.posts.update_one(q, {"$set": {"enabled": new_enabled, "updated_at": datetime.now(timezone.utc)}})
+            return new_enabled
+        return await asyncio.to_thread(_toggle)
 
     async def next_reply_post(self, mode="rotate"):
-        """Pick an enabled post for an incoming opted-in DM auto-reply.
+        posts = await self.list_posts(enabled_only=True)
+        if not posts:
+            return None
+        if mode == "random":
+            return random.choice(posts)
 
-        Persist the rotation counter atomically, including through bot restarts.
-        """
-        import random
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            if mode == "rotate":
-                await conn.execute("BEGIN IMMEDIATE")
-            cur = await conn.execute("SELECT * FROM promo_posts WHERE enabled=1 ORDER BY id")
-            posts = [dict(row) for row in await cur.fetchall()]
-            if not posts:
-                if mode == "rotate":
-                    await conn.rollback()
-                return None
-            if mode == "random":
-                return random.choice(posts)
-            cur = await conn.execute("SELECT value FROM settings WHERE key='reply_post_cursor'")
-            row = await cur.fetchone()
-            cursor = int(row[0]) if row else 0
-            chosen = posts[cursor % len(posts)]
-            await conn.execute(
-                "INSERT INTO settings(key,value) VALUES('reply_post_cursor',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(cursor + 1),),
+        def _next_cursor():
+            doc = self.settings.find_one_and_update(
+                {"owner_id": self.owner_id, "key": "reply_post_cursor"},
+                {"$inc": {"cursor": 1},
+                 "$setOnInsert": {"value": "0", "created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+                return_document=ReturnDocument.BEFORE,
             )
-            await conn.commit()
-            return chosen
+            if not doc:
+                cursor = 0
+            elif "cursor" in doc:
+                cursor = int(doc.get("cursor", 0))
+            else:
+                try:
+                    cursor = int(doc.get("value", 0))
+                except (TypeError, ValueError):
+                    cursor = 0
+                self.settings.update_one(
+                    {"owner_id": self.owner_id, "key": "reply_post_cursor"},
+                    {"$set": {"cursor": cursor + 1, "value": str(cursor + 1)}},
+                )
+                return cursor
+            self.settings.update_one(
+                {"owner_id": self.owner_id, "key": "reply_post_cursor"},
+                {"$set": {"value": str(cursor + 1)}},
+            )
+            return cursor
+
+        cursor = await asyncio.to_thread(_next_cursor)
+        return posts[cursor % len(posts)]
 
 
 class MongoSessionStore:
