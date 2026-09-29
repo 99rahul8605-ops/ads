@@ -13,11 +13,12 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -2230,7 +2231,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No sessions added.", reply_markup=MENU)
             return
         lines = ["👤 <b>SESSIONS</b>\n"]
+        buttons = []
         for r in rows:
+            sid = str(r["id"])
             gcount = stats.cached_group_count.get(r["id"], "?")
             ucount = stats.cached_user_count.get(r["id"], "?")
             uname = f"@{r['username']}" if r.get("username") else "no username"
@@ -2242,11 +2245,20 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status = "🔐 NEEDS RELOGIN"
             else:
                 status = "🟢 ACTIVE"
+            display_name = r['first_name'] or r['label'] or str(r.get('tg_user_id') or sid)
             lines.append(
-                f"#{r['id']} • {esc(r['first_name'] or r['label'])} • {esc(uname)}\n"
+                f"#{sid} • {esc(display_name)} • {esc(uname)}\n"
                 f"{status} • groups: {gcount} • users: {ucount}"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
+            buttons.append([InlineKeyboardButton(
+                f"🗑 Remove {str(display_name)[:24]}",
+                callback_data=f"sess_rm:{sid}",
+            )])
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
     elif text == "🗑 Remove Session":
         rows = await session_store.get_sessions()
@@ -2443,6 +2455,60 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text(f"❌ Could not save post:\n{type(e).__name__}: {e}", reply_markup=MENU)
 
 
+async def session_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    sid = (q.data or "").split(":", 1)[1]
+    rows = await session_store.get_sessions()
+    row = next((r for r in rows if str(r["id"]) == sid), None)
+    if not row:
+        await q.answer("Session not found.", show_alert=True)
+        return
+    label = row.get("first_name") or row.get("label") or row.get("tg_user_id") or sid
+    kb = InlineKeyboardMarkup([[ 
+        InlineKeyboardButton("✅ Yes, remove", callback_data=f"sess_rm_yes:{sid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"sess_rm_no:{sid}"),
+    ]])
+    await q.edit_message_text(
+        f"🗑 <b>REMOVE SESSION?</b>\n\n"
+        f"👤 {esc(label)}\n"
+        f"🆔 <code>{esc(row.get('tg_user_id') or '—')}</code>\n\n"
+        "This will disconnect this account from the Ads Bot and remove its saved session.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def session_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    sid = (q.data or "").split(":", 1)[1]
+    rows = await session_store.get_sessions()
+    row = next((r for r in rows if str(r["id"]) == sid), None)
+    if not row:
+        await q.edit_message_text("ℹ️ Session is already removed.")
+        return
+    label = row.get("first_name") or row.get("label") or row.get("tg_user_id") or sid
+    await close_account_client(sid)
+    deleted = await session_store.delete_session(sid)
+    target_cache.clear()
+    stats.cached_group_count.pop(sid, None)
+    stats.cached_user_count.pop(sid, None)
+    if deleted:
+        await q.edit_message_text(
+            f"✅ <b>SESSION REMOVED</b>\n\n👤 {esc(label)}",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await q.edit_message_text("❌ Session could not be removed. Please refresh Sessions and try again.")
+
+
+async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Cancelled")
+    await q.edit_message_text("✅ Session removal cancelled.")
+
+
 async def post_init(app: Application):
     await load_approved_users()
     # Owner database and legacy encrypted sessions are never migrated/deleted.
@@ -2479,6 +2545,9 @@ def main():
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
     app.add_handler(CommandHandler("start", authorized_handler(start)))
+    app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_cancel), pattern=r"^sess_rm_no:[0-9a-fA-F]+$"))
     # Save-post handler must run before the generic text/menu handler.
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION), authorized_handler(save_post_message)), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, authorized_handler(save_post_message)), group=0)
