@@ -1970,25 +1970,79 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.pop(uid, None)
         session_string = text.strip()
         await safe_delete_message(update.message)
-        msg = await context.bot.send_message(uid, "⏳ Validating session...", reply_markup=MENU)
+        status_msg = await context.bot.send_message(uid, "⏳ Validating session...")
         client = None
+        me = None
+        stored_sid = None
         try:
+            # Phase 1: validate the supplied StringSession and identify the account.
             client = await make_client(session_string)
             me = await client.get_me()
             label = f"{me.first_name or 'Account'} ({me.id})"
             enc = fernet.encrypt(session_string.encode()).decode()
-            stored_sid = await session_store.add_session(label, enc, me.id, me.username, me.first_name)
+            stored_sid = await session_store.add_session(
+                label, enc, me.id, me.username, me.first_name
+            )
+
+            # Never keep the validation connection alive while starting the
+            # long-lived shared client for the same authorization key.
+            await client.disconnect()
+            client = None
+
+            # Remove any stale pooled client and immediately start the one
+            # shared client used by promotion/listeners/auto-reply.
             await close_account_client(str(me.id))
             _session_client_keys[str(stored_sid)] = str(me.id)
-            await msg.edit_text(
-                f"✅ Session added.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.",
+            rows = await session_store.get_sessions(enabled_only=False)
+            stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
+            if stored_row is None:
+                raise RuntimeError("Session was saved but could not be loaded from MongoDB")
+
+            shared = await get_account_client(stored_row)
+            connected = bool(shared and shared.is_connected())
+            username = f"@{me.username}" if me.username else "—"
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            await context.bot.send_message(
+                uid,
+                "✅ <b>SESSION CONNECTED</b>\n\n"
+                f"👤 <b>Account:</b> {esc(label)}\n"
+                f"🆔 <b>Telegram ID:</b> <code>{me.id}</code>\n"
+                f"🔗 <b>Username:</b> {esc(username)}\n"
+                f"📡 <b>Status:</b> {'🟢 CONNECTED' if connected else '🟡 SAVED / CONNECTING'}\n\n"
+                "Promotion, listeners, auto-reply and group updates will use this account's shared connection.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=MENU,
             )
         except Exception as e:
-            await msg.edit_text(f"❌ Invalid/unusable session:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML)
+            # If validation succeeded but live shared connection failed, keep the
+            # saved record and clearly tell the operator what happened.
+            detail = esc(type(e).__name__ + ': ' + str(e))
+            try:
+                await status_msg.edit_text(
+                    "❌ <b>SESSION NOT READY</b>\n\n"
+                    f"<code>{detail}</code>\n\n"
+                    "If this is a temporary connection error, try again. If it is AuthKeyDuplicatedError, create a fresh session.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                await context.bot.send_message(
+                    uid,
+                    "❌ <b>SESSION NOT READY</b>\n\n"
+                    f"<code>{detail}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=MENU,
+                )
         finally:
             if client:
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
         return
 
     if current == "await_phone":
