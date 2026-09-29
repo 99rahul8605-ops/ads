@@ -13,7 +13,7 @@ class AccountPacer:
         self._next_allowed: dict[str, float] = {}
         self._urgent_waiters: dict[str, int] = {}
 
-    async def run(self, account_id: str, min_gap_seconds: float, send, *, priority=False):
+    async def run(self, account_id: str, min_gap_seconds: float, send, *, priority=False, gap_on_error=True):
         account_id = str(account_id)
         lock = self._locks.setdefault(account_id, asyncio.Lock())
         registered_urgent = bool(priority)
@@ -35,12 +35,18 @@ class AccountPacer:
                         if registered_urgent:
                             self._urgent_waiters[account_id] -= 1
                             registered_urgent = False
+                        succeeded = False
                         try:
-                            return await send()
+                            result = await send()
+                            succeeded = True
+                            return result
                         finally:
-                            # Failed sends also consume Telegram's rate budget.
-                            self._next_allowed[account_id] = (time.monotonic()
-                                                              + max(0, min_gap_seconds))
+                            # Successful sends use the normal pacing gap.  Callers may
+                            # opt out of charging the gap for failed/skipped targets so
+                            # the next target can be attempted immediately.
+                            if succeeded or gap_on_error:
+                                self._next_allowed[account_id] = (time.monotonic()
+                                                                  + max(0, min_gap_seconds))
                 await asyncio.sleep(0.01)
         finally:
             if registered_urgent:

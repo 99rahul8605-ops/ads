@@ -987,6 +987,10 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 await pacer.run(
                     sid, delay if target_type == "group" else DM_BROADCAST_DELAY_SECONDS,
                     lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)),
+                    # A dead/unwritable/invalid target should not burn the normal
+                    # group pacing delay. FloodWait/PeerFlood are handled below
+                    # with account-level cooldowns before the next target.
+                    gap_on_error=(target_type != "group"),
                 )
                 stats.sent += 1
                 if target_type == "group":
