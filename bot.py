@@ -623,16 +623,65 @@ async def make_client(session_string: str) -> TelegramClient:
     return client
 
 
-async def get_account_client(row: dict) -> TelegramClient:
-    """Return the single long-lived Telethon client for this Telegram account.
+async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramClient:
+    """Attach all runtime handlers to an already-connected authorized client.
 
-    Promotion, DM broadcast, auto-reply and group-update listeners all share it.
+    This is used after session validation/login so the validated connection itself
+    becomes the one shared client. No second client is created for the same auth key.
     """
     sid = str(row["id"])
     tg_id = row.get("tg_user_id")
     account_key = str(tg_id if tg_id is not None else sid)
-    session_client_keys = globals().setdefault("_session_client_keys", {})
-    session_client_keys[sid] = account_key
+    _session_client_keys[sid] = account_key
+
+    if not client.is_connected():
+        await client.connect()
+    if not await client.is_user_authorized():
+        raise RuntimeError("Session is not authorized")
+
+    owner = tenant_id()
+    handler = account_reply_handler(sid)
+
+    async def scoped_dm(event):
+        token = CURRENT_OPERATOR.set(owner)
+        try:
+            return await handler(event)
+        finally:
+            CURRENT_OPERATOR.reset(token)
+
+    me = await client.get_me()
+    my_id = me.id
+
+    async def scoped_group_join(event):
+        token = CURRENT_OPERATOR.set(owner)
+        try:
+            await handle_group_join_event(event, sid, my_id)
+        finally:
+            CURRENT_OPERATOR.reset(token)
+
+    async def scoped_group_message(event):
+        if not getattr(event, "is_group", False):
+            return
+        token = CURRENT_OPERATOR.set(owner)
+        try:
+            await remember_group_from_event(event, sid)
+        finally:
+            CURRENT_OPERATOR.reset(token)
+
+    client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
+    client.add_event_handler(scoped_group_join, events.ChatAction())
+    client.add_event_handler(scoped_group_message, events.NewMessage(incoming=True))
+    _account_dm_clients[account_key] = client
+    log.info("Shared Telegram client ready for %s (%s)", row.get("label", sid), row.get("tg_user_id", account_key))
+    return client
+
+
+async def get_account_client(row: dict) -> TelegramClient:
+    """Return exactly one long-lived Telethon client for this Telegram account."""
+    sid = str(row["id"])
+    tg_id = row.get("tg_user_id")
+    account_key = str(tg_id if tg_id is not None else sid)
+    _session_client_keys[sid] = account_key
     lock = _account_client_locks.setdefault(account_key, asyncio.Lock())
     async with lock:
         existing = _account_dm_clients.get(account_key)
@@ -646,6 +695,7 @@ async def get_account_client(row: dict) -> TelegramClient:
                 pass
         try:
             client = await make_client(decrypt_session(row["session_enc"]))
+            return await _adopt_shared_client(row, client)
         except errors.AuthKeyDuplicatedError:
             await session_store.mark_needs_relogin(
                 sid,
@@ -657,38 +707,6 @@ async def get_account_client(row: dict) -> TelegramClient:
                 row.get("tg_user_id", "?"),
             )
             raise
-
-        owner = tenant_id()
-        handler = account_reply_handler(sid)
-        async def scoped_dm(event):
-            token = CURRENT_OPERATOR.set(owner)
-            try:
-                return await handler(event)
-            finally:
-                CURRENT_OPERATOR.reset(token)
-        client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
-
-        me = await client.get_me()
-        my_id = me.id
-        async def scoped_group_join(event):
-            token = CURRENT_OPERATOR.set(owner)
-            try:
-                await handle_group_join_event(event, sid, my_id)
-            finally:
-                CURRENT_OPERATOR.reset(token)
-        async def scoped_group_message(event):
-            if not getattr(event, "is_group", False):
-                return
-            token = CURRENT_OPERATOR.set(owner)
-            try:
-                await remember_group_from_event(event, sid)
-            finally:
-                CURRENT_OPERATOR.reset(token)
-        client.add_event_handler(scoped_group_join, events.ChatAction())
-        client.add_event_handler(scoped_group_message, events.NewMessage(incoming=True))
-        _account_dm_clients[account_key] = client
-        log.info("Shared Telegram client ready for %s (%s)", row.get("label", sid), row.get("tg_user_id", account_key))
-        return client
 
 
 async def close_account_client(sid_or_account_key: str):
@@ -1815,10 +1833,13 @@ async def save_logged_in_client(client: TelegramClient):
     enc = fernet.encrypt(session_string.encode()).decode()
     stored_sid = await session_store.add_session(label, enc, me.id, me.username, me.first_name)
     await close_account_client(str(me.id))
-    _session_client_keys[str(stored_sid)] = str(me.id)
-    # Do not scan dialogs here. The cache is built on first Start or manual Rescan,
-    # which avoids duplicate GetDialogsRequest bursts during account setup.
-    return label, None, None
+    rows = await session_store.get_sessions(enabled_only=False)
+    stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
+    if stored_row is None:
+        raise RuntimeError("Session was saved but could not be loaded from MongoDB")
+    await _adopt_shared_client(stored_row, client)
+    # Caller must not disconnect this client after successful adoption.
+    return label, None, None, stored_sid
 
 
 async def safe_delete_message(message):
@@ -2027,7 +2048,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         me = None
         stored_sid = None
         try:
-            # Phase 1: validate the supplied StringSession and identify the account.
+            # Validate once, then promote THIS SAME connection into the shared
+            # runtime client. This prevents validation/listener overlap for one auth key.
             client = await make_client(session_string)
             me = await client.get_me()
             label = f"{me.first_name or 'Account'} ({me.id})"
@@ -2036,21 +2058,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 label, enc, me.id, me.username, me.first_name
             )
 
-            # Never keep the validation connection alive while starting the
-            # long-lived shared client for the same authorization key.
-            await client.disconnect()
-            client = None
-
-            # Remove any stale pooled client and immediately start the one
-            # shared client used by promotion/listeners/auto-reply.
+            # Close only any OLD pooled connection for this Telegram account.
             await close_account_client(str(me.id))
-            _session_client_keys[str(stored_sid)] = str(me.id)
             rows = await session_store.get_sessions(enabled_only=False)
             stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
             if stored_row is None:
                 raise RuntimeError("Session was saved but could not be loaded from MongoDB")
 
-            shared = await get_account_client(stored_row)
+            shared = await _adopt_shared_client(stored_row, client)
+            client = None  # ownership moved to shared pool; do not disconnect in finally
             connected = bool(shared and shared.is_connected())
             username = f"@{me.username}" if me.username else "—"
 
@@ -2136,8 +2152,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = flow["client"]
         try:
             await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["phone_code_hash"])
-            label, group_count, user_count = await save_logged_in_client(client)
+            label, group_count, user_count, stored_sid = await save_logged_in_client(client)
             state.pop(uid, None)
+            flow["client"] = None  # shared pool owns it now
             await cleanup_login_flow(uid)
             await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.SessionPasswordNeededError:
@@ -2167,8 +2184,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = flow["client"]
         try:
             await client.sign_in(password=password)
-            label, group_count, user_count = await save_logged_in_client(client)
+            label, group_count, user_count, stored_sid = await save_logged_in_client(client)
             state.pop(uid, None)
+            flow["client"] = None  # shared pool owns it now
             await cleanup_login_flow(uid)
             await context.bot.send_message(uid, f"✅ Login successful and session saved.\n\n👤 {esc(label)}\n🎯 Target cache will be built on first Start Promo or manual Rescan Targets.", parse_mode=ParseMode.HTML, reply_markup=MENU)
         except errors.PasswordHashInvalidError:
