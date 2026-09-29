@@ -86,3 +86,6 @@ MEDIA_DIR=media
 There is no `DB_PATH` setting anymore.
 
 Optional pacing values remain in `.env.example`.
+
+## Temporary connection retry
+Temporary `ConnectionError`, `OSError`, and asyncio timeout failures now retry on the affected account only with backoff: 2s, 5s, 10s, then 20s. Promotion retries the same target after reconnecting. FloodWait, PeerFlood, revoked authorization, and duplicated authorization keys are not treated as temporary network failures.

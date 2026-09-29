@@ -983,6 +983,42 @@ async def guarded_account_send(session_id: str, operation):
     return await operation()
 
 
+
+NETWORK_RETRY_DELAYS = (2, 5, 10, 20)
+
+
+async def run_with_connection_retry(row: dict, operation_factory, purpose: str):
+    """Retry only temporary transport failures for one Telegram account.
+
+    operation_factory receives the currently shared client and must return an awaitable.
+    Auth/Flood/PeerFlood errors intentionally escape immediately.
+    """
+    sid = str(row["id"])
+    last_exc = None
+    for attempt in range(len(NETWORK_RETRY_DELAYS) + 1):
+        client = await get_account_client(row)
+        try:
+            return await operation_factory(client)
+        except (errors.AuthKeyDuplicatedError, errors.AuthKeyUnregisteredError,
+                errors.FloodWaitError, errors.PeerFloodError):
+            raise
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            if attempt >= len(NETWORK_RETRY_DELAYS):
+                break
+            delay = NETWORK_RETRY_DELAYS[attempt]
+            log.warning(
+                "Temporary connection error for %s (%s) during %s: %s; retrying in %ss",
+                row.get("label", sid), row.get("tg_user_id", "?"), purpose,
+                type(exc).__name__, delay,
+            )
+            await close_account_client(sid)
+            await asyncio.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise ConnectionError(f"{purpose} failed after connection retries")
+
+
 async def send_saved_post(client: TelegramClient, entity, post: dict):
     text = post.get("html_text") or ""
     media_path = post.get("media_path")
@@ -1034,7 +1070,14 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 # A single pacing lock is shared with this account's incoming DM auto-reply.
                 await pacer.run(
                     sid, delay if target_type == "group" else DM_BROADCAST_DELAY_SECONDS,
-                    lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)),
+                    lambda: guarded_account_send(
+                        sid,
+                        lambda: run_with_connection_retry(
+                            row,
+                            lambda active_client: send_saved_post(active_client, entity, post),
+                            f"promotion to {name}",
+                        ),
+                    ),
                     # A dead/unwritable/invalid target should not burn the normal
                     # group pacing delay. FloodWait/PeerFlood are handled below
                     # with account-level cooldowns before the next target.
@@ -1355,7 +1398,14 @@ async def run_one_time_dm_broadcast(app: Application):
                 metric["target"] = f"DM: {name}"
                 try:
                     await pacer.run(sid, DM_BROADCAST_DELAY_SECONDS,
-                                    lambda: guarded_account_send(sid, lambda: send_saved_post(client, entity, post)))
+                                    lambda: guarded_account_send(
+                                        sid,
+                                        lambda: run_with_connection_retry(
+                                            row,
+                                            lambda active_client: send_saved_post(active_client, entity, post),
+                                            f"manual DM to {name}",
+                                        ),
+                                    ))
                     stats.sent += 1
                     stats.user_sent += 1
                 except AccountPausedError as e:
@@ -1551,6 +1601,8 @@ async def account_auto_reply_service(app: Application):
     """Keep one Telegram connection per enabled account, shared by all workloads."""
     my_session_ids = set()
     last_sync: dict[str, float] = {}
+    listener_retry_after: dict[str, float] = {}
+    listener_retry_step: dict[str, int] = {}
     try:
         while True:
             try:
@@ -1566,7 +1618,12 @@ async def account_auto_reply_service(app: Application):
                             last_sync.pop(sid, None)
                 for sid, row in enabled.items():
                     try:
+                        now_loop = time.monotonic()
+                        if now_loop < listener_retry_after.get(sid, 0):
+                            continue
                         client = await get_account_client(row)
+                        listener_retry_step[sid] = 0
+                        listener_retry_after.pop(sid, None)
                         # Self-join events usually arrive immediately. This
                         # periodic catch-up handles missed updates/reconnects
                         # without requiring the Rescan Targets menu button.
@@ -1584,6 +1641,16 @@ async def account_auto_reply_service(app: Application):
                             "Account disabled until fresh login: %s (%s)",
                             row.get("label", sid),
                             row.get("tg_user_id", "?"),
+                        )
+                    except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                        step = min(listener_retry_step.get(sid, 0), len(NETWORK_RETRY_DELAYS) - 1)
+                        delay = NETWORK_RETRY_DELAYS[step]
+                        listener_retry_step[sid] = min(step + 1, len(NETWORK_RETRY_DELAYS) - 1)
+                        listener_retry_after[sid] = time.monotonic() + delay
+                        await close_account_client(sid)
+                        log.warning(
+                            "Account listener temporary connection error for %s: %s; retry in %ss",
+                            row.get("label", sid), type(e).__name__, delay,
                         )
                     except Exception as e:
                         log.warning("Account listener unavailable for %s: %s",
