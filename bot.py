@@ -644,8 +644,19 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
         token_raw = decrypt_bot_token(row["token_enc"])
         api_bot = Bot(token=token_raw)
         await api_bot.initialize()
+        # Bot API getUpdates cannot work while a webhook is configured.
+        # Remove stale webhooks automatically so the added bot can become active
+        # on this server without manual cleanup. Pending updates are preserved.
+        try:
+            await api_bot.delete_webhook(drop_pending_updates=False)
+        except TelegramError as exc:
+            log.warning("Could not clear webhook owner=%s bot_id=%s: %s", owner_uid, bot_id, type(exc).__name__)
         me = await api_bot.get_me()
-        BOT_ACCOUNT_STATUS[key] = "🟢 LISTENING"
+        can_read_all = bool(getattr(me, "can_read_all_group_messages", False))
+        BOT_ACCOUNT_STATUS[key] = (
+            "🟢 LISTENING" if can_read_all
+            else "🟠 LISTENING • PRIVACY ON"
+        )
         offset = None
         retry_delay = 2
         log.info("Bot account listener connected owner=%s bot_id=%s username=%s", owner_uid, bot_id, me.username)
@@ -735,8 +746,10 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                             scope, owner_uid, bot_id, chat.id, type(exc).__name__,
                         )
             except Conflict:
-                BOT_ACCOUNT_STATUS[key] = "⚠️ POLLING CONFLICT"
-                # Usually means the same bot token is running elsewhere or has another getUpdates consumer.
+                BOT_ACCOUNT_STATUS[key] = "⚠️ POLLING CONFLICT • TOKEN USED ELSEWHERE"
+                # Another getUpdates consumer is using the same token. A webhook is
+                # already cleared above, so this normally means another running bot process.
+                await db.record_bot_event(bot_id, "failed", "listener", 0, None, "Polling conflict: token used elsewhere")
                 await asyncio.sleep(30)
             except RetryAfter as exc:
                 BOT_ACCOUNT_STATUS[key] = f"⏳ FLOODWAIT {int(exc.retry_after)}s"
@@ -2801,7 +2814,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Group: one reply per bot + group + user per cooldown\n"
             "• DM: one reply per bot + user per cooldown\n\n"
             "A bot does not need to be group admin to send a reply if normal sending is allowed. "
-            "To receive every ordinary group message without admin rights, disable the bot's Privacy Mode in @BotFather (/setprivacy).",
+            "For a non-admin bot to receive ordinary group messages, disable Privacy Mode in @BotFather → /setprivacy. "
+            "If status shows POLLING CONFLICT, the same bot token is still running on another server/process.",
             parse_mode=ParseMode.HTML,
             reply_markup=BOT_ACCOUNT_MENU,
         )
