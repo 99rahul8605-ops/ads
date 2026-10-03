@@ -590,6 +590,15 @@ async def bot_group_reply_post_for(owner_uid: int):
         CURRENT_OPERATOR.reset(token)
 
 
+async def bot_dm_auto_reply_text_for(owner_uid: int) -> str:
+    """Use the configured Auto Reply text for private DMs to added bot accounts."""
+    token = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        return await db.get_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+
 async def send_bot_saved_post_reply(api_bot: Bot, chat_id: int, reply_to_message_id: int, post: dict):
     """Send one saved promotion post as an actual reply via the connected bot account."""
     caption = post.get("html_text") or None
@@ -631,8 +640,8 @@ def decrypt_bot_token(value: str) -> str:
 async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
     """Long-poll one connected Bot API account and auto-reply in groups and DMs.
 
-    Group cooldown is per bot + group + user. Private-DM cooldown is per bot + user
-    (private chat id equals that user chat), persisted in MongoDB across restarts.
+    Groups use enabled saved promotion posts. Private DMs use the configured
+    Auto Reply text. Cooldowns persist in MongoDB across restarts.
     """
     key = (int(owner_uid), int(bot_id))
     token_ctx = CURRENT_OPERATOR.set(owner_uid)
@@ -716,13 +725,28 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
 
                     scope = "dm" if chat.type == "private" else "group"
                     try:
-                        post = await bot_group_reply_post_for(owner_uid)
-                        if not post:
-                            await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
-                            await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, "No enabled promotion post")
-                            continue
-                        await send_bot_saved_post_reply(api_bot, chat.id, msg.message_id, post)
-                        await db.record_bot_event(bot_id, "sent", scope, chat.id, usr.id, f"post#{post.get('id', '?')}")
+                        if chat.type == "private":
+                            dm_text = (await bot_dm_auto_reply_text_for(owner_uid) or "").strip()
+                            if not dm_text:
+                                await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                                await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, "Auto Reply text is empty")
+                                continue
+                            await api_bot.send_message(
+                                chat_id=chat.id,
+                                text=dm_text,
+                                reply_to_message_id=msg.message_id,
+                                allow_sending_without_reply=False,
+                                disable_web_page_preview=True,
+                            )
+                            await db.record_bot_event(bot_id, "sent", scope, chat.id, usr.id, "Auto Reply text")
+                        else:
+                            post = await bot_group_reply_post_for(owner_uid)
+                            if not post:
+                                await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                                await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, "No enabled promotion post")
+                                continue
+                            await send_bot_saved_post_reply(api_bot, chat.id, msg.message_id, post)
+                            await db.record_bot_event(bot_id, "sent", scope, chat.id, usr.id, f"post#{post.get('id', '?')}")
                     except RetryAfter as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                         await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, f"RetryAfter {int(exc.retry_after)}s")
