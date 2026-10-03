@@ -199,7 +199,8 @@ ADD_SESSION_MENU = ReplyKeyboardMarkup(
 BOT_ACCOUNT_MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Bot", "👤 Bot Accounts"],
-        ["🟢 Toggle Group Reply", "⏱ Group Reply Cooldown"],
+        ["📊 Bot Stats", "📜 Bot Logs"],
+        ["🟢 Toggle Bot Auto Reply", "⏱ Bot Reply Cooldown"],
         ["🗑 Remove Bot"],
         ["⬅️ Back"],
     ],
@@ -628,10 +629,10 @@ def decrypt_bot_token(value: str) -> str:
 
 
 async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
-    """Long-poll one connected Bot API account and reply in groups.
+    """Long-poll one connected Bot API account and auto-reply in groups and DMs.
 
-    Cooldown is per bot + group + user and is stored in MongoDB, so a restart
-    does not reset the 10-minute window.
+    Group cooldown is per bot + group + user. Private-DM cooldown is per bot + user
+    (private chat id equals that user chat), persisted in MongoDB across restarts.
     """
     key = (int(owner_uid), int(bot_id))
     token_ctx = CURRENT_OPERATOR.set(owner_uid)
@@ -658,7 +659,7 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                 updates = await api_bot.get_updates(
                     offset=offset,
                     timeout=30,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "my_chat_member"],
                     read_timeout=40,
                     connect_timeout=20,
                     pool_timeout=20,
@@ -666,12 +667,28 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                 retry_delay = 2
                 for upd in updates:
                     offset = upd.update_id + 1
+
+                    member_upd = getattr(upd, "my_chat_member", None)
+                    if member_upd and member_upd.chat and member_upd.chat.type in {"group", "supergroup"}:
+                        new_status = str(getattr(member_upd.new_chat_member, "status", ""))
+                        active = new_status not in {"left", "kicked"}
+                        await db.upsert_bot_group(
+                            bot_id, member_upd.chat.id, member_upd.chat.title or str(member_upd.chat.id), active
+                        )
+                        await db.record_bot_event(
+                            bot_id, "joined" if active else "left", "group", member_upd.chat.id,
+                            getattr(member_upd.from_user, "id", None), member_upd.chat.title or ""
+                        )
+                        continue
+
                     msg = upd.effective_message
                     usr = upd.effective_user
                     chat = upd.effective_chat
                     if not msg or not usr or not chat:
                         continue
-                    if chat.type not in {"group", "supergroup"}:
+                    if chat.type in {"group", "supergroup"}:
+                        await db.upsert_bot_group(bot_id, chat.id, chat.title or str(chat.id), True)
+                    if chat.type not in {"private", "group", "supergroup"}:
                         continue
                     # Ignore join/leave/pin/topic and other service updates; reply only to user content.
                     if not msg.text and msg.effective_attachment is None:
@@ -686,29 +703,36 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                     if not allowed:
                         continue
 
+                    scope = "dm" if chat.type == "private" else "group"
                     try:
                         post = await bot_group_reply_post_for(owner_uid)
                         if not post:
                             await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                            await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, "No enabled promotion post")
                             continue
                         await send_bot_saved_post_reply(api_bot, chat.id, msg.message_id, post)
+                        await db.record_bot_event(bot_id, "sent", scope, chat.id, usr.id, f"post#{post.get('id', '?')}")
                     except RetryAfter as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, f"RetryAfter {int(exc.retry_after)}s")
                         await asyncio.sleep(float(exc.retry_after) + 1.0)
                     except (Forbidden, BadRequest) as exc:
-                        # No send permission / deleted message / restricted bot.
+                        # No send permission / deleted message / blocked bot.
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, type(exc).__name__)
                         log.info(
-                            "Bot group reply skipped owner=%s bot_id=%s chat=%s: %s",
-                            owner_uid, bot_id, chat.id, type(exc).__name__,
+                            "Bot %s reply skipped owner=%s bot_id=%s chat=%s: %s",
+                            scope, owner_uid, bot_id, chat.id, type(exc).__name__,
                         )
-                    except (NetworkError, TimedOut):
+                    except (NetworkError, TimedOut) as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        await db.record_bot_event(bot_id, "failed", scope, chat.id, usr.id, type(exc).__name__)
                     except TelegramError as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        await db.record_bot_event(bot_id, "failed", scope, chat.id, usr.id, type(exc).__name__)
                         log.warning(
-                            "Bot group reply failed owner=%s bot_id=%s chat=%s: %s",
-                            owner_uid, bot_id, chat.id, type(exc).__name__,
+                            "Bot %s reply failed owner=%s bot_id=%s chat=%s: %s",
+                            scope, owner_uid, bot_id, chat.id, type(exc).__name__,
                         )
             except Conflict:
                 BOT_ACCOUNT_STATUS[key] = "⚠️ POLLING CONFLICT"
@@ -2677,6 +2701,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤖 {esc(me.first_name or 'Bot')}\n"
                 f"👤 @{esc(me.username or 'no_username')}\n"
                 f"🆔 <code>{me.id}</code>\n\n"
+                "DM auto-reply is also active and uses the same saved promotion posts/cooldown.\n\n"
                 "For replies to every normal group message while the bot is not admin, disable Privacy Mode in @BotFather → /setprivacy for this bot. "
                 "The bot must still be a member and allowed to send messages.",
                 parse_mode=ParseMode.HTML,
@@ -2703,7 +2728,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.set_setting("bot_group_reply_cooldown_seconds", str(minutes * 60))
         state.pop(uid, None)
         await update.message.reply_text(
-            f"✅ Same user will receive at most one reply every {minutes} minute(s) in the same group.",
+            f"✅ Bot auto-reply cooldown set to {minutes} minute(s) for both group replies and DMs.",
             reply_markup=BOT_ACCOUNT_MENU,
         )
         return
@@ -2769,10 +2794,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await db.list_bot_accounts()
         await update.message.reply_text(
             "🤖 <b>BOT ACCOUNT MODE</b>\n\n"
-            f"Group reply: <b>{'ON' if enabled else 'OFF'}</b>\n"
-            f"Cooldown: <b>{cooldown // 60} min per user, per group</b>\n"
+            f"Auto reply (Groups + DMs): <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"Cooldown: <b>{cooldown // 60} min</b>\n"
             f"Connected bot accounts: <b>{len(rows)}</b>\n\n"
-            "Replies use the same enabled promotion posts saved in 📝 Posts and follow the current Rotate/Random post mode.\n\n"
+            "Replies use the same enabled promotion posts saved in 📝 Posts and follow the current Rotate/Random post mode.\n"
+            "• Group: one reply per bot + group + user per cooldown\n"
+            "• DM: one reply per bot + user per cooldown\n\n"
             "A bot does not need to be group admin to send a reply if normal sending is allowed. "
             "To receive every ordinary group message without admin rights, disable the bot's Privacy Mode in @BotFather (/setprivacy).",
             parse_mode=ParseMode.HTML,
@@ -2799,28 +2826,82 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bid = int(row["bot_id"])
             status = BOT_ACCOUNT_STATUS.get((uid, bid), "🟡 STARTING" if row.get("enabled", True) else "⚪ DISABLED")
             uname = f"@{row.get('username')}" if row.get("username") else "no username"
+            gcount = await db.count_bot_groups(bid)
+            bst = await db.bot_event_stats(bid)
             lines.append(
                 f"{status} • <b>{esc(row.get('first_name') or uname)}</b>\n"
-                f"{esc(uname)} • ID <code>{bid}</code>"
+                f"{esc(uname)} • ID <code>{bid}</code>\n"
+                f"👥 Known groups: <b>{gcount}</b> • ✅ Replies: <b>{bst['sent']}</b>"
             )
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
         return
 
-    if text == "🟢 Toggle Group Reply":
+    if text == "📊 Bot Stats":
+        rows = await db.list_bot_accounts()
+        if not rows:
+            await update.message.reply_text("No bot accounts added.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        blocks = ["📊 <b>BOT ACCOUNT STATS</b>"]
+        for row in rows:
+            bid = int(row["bot_id"])
+            label = row.get("first_name") or ("@" + row.get("username") if row.get("username") else str(bid))
+            status = BOT_ACCOUNT_STATUS.get((uid, bid), "🟡 STARTING" if row.get("enabled", True) else "⚪ DISABLED")
+            gcount = await db.count_bot_groups(bid)
+            st = await db.bot_event_stats(bid)
+            blocks.append(
+                f"{status} <b>{esc(label)}</b>\n"
+                f"👥 Known groups: <b>{gcount}</b>\n"
+                f"✅ Replies: <b>{st['sent']}</b> (Groups {st['group_sent']} • DMs {st['dm_sent']})\n"
+                f"⏭ Skipped: <b>{st['skipped']}</b> • ❌ Failed: <b>{st['failed']}</b>"
+            )
+        await update.message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
+        return
+
+    if text == "📜 Bot Logs":
+        rows = await db.list_bot_accounts()
+        if not rows:
+            await update.message.reply_text("No bot accounts added.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        names = {int(r['bot_id']): (r.get('username') or r.get('first_name') or str(r['bot_id'])) for r in rows}
+        events = await db.list_bot_events(limit=25)
+        if not events:
+            await update.message.reply_text("📜 No bot-account events recorded yet.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        lines = ["📜 <b>RECENT BOT LOGS</b>"]
+        for ev in reversed(events):
+            ts = ev.get('created_at')
+            when = ts.strftime('%H:%M:%S') if ts else '--:--:--'
+            bid = int(ev.get('bot_id', 0))
+            label = names.get(bid, str(bid))
+            detail = ev.get('detail') or ''
+            lines.append(
+                f"<code>{when}</code> • <b>{esc(label)}</b> • {esc(ev.get('scope','-'))} • "
+                f"<b>{esc(ev.get('event','-').upper())}</b>" + (f" • {esc(detail)[:100]}" if detail else "")
+            )
+        text_out = "\n".join(lines)
+        if len(text_out) > 3900:
+            text_out = text_out[-3900:]
+            text_out = "📜 <b>RECENT BOT LOGS</b>\n" + text_out.split('\n',1)[-1]
+        await update.message.reply_text(text_out, parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
+        return
+
+    if text in {"🟢 Toggle Group Reply", "🟢 Toggle Bot Auto Reply"}:
         enabled = (await db.get_setting("bot_group_reply_enabled", "true")).lower() in {"true", "1", "yes", "on"}
         await db.set_setting("bot_group_reply_enabled", "false" if enabled else "true")
         await update.message.reply_text(
-            f"✅ Group reply is now {'OFF' if enabled else 'ON'}.",
+            f"✅ Bot auto reply (Groups + DMs) is now {'OFF' if enabled else 'ON'}.",
             reply_markup=BOT_ACCOUNT_MENU,
         )
         return
 
-    if text == "⏱ Group Reply Cooldown":
+    if text in {"⏱ Group Reply Cooldown", "⏱ Bot Reply Cooldown"}:
         current_cd = await bot_group_reply_cooldown_for(uid)
         state[uid] = "await_bot_group_reply_cooldown"
         await update.message.reply_text(
             f"Current cooldown: {current_cd // 60} minute(s).\n\n"
-            "Send new cooldown in minutes. Same user + same group gets one reply per cooldown window.",
+            "Send new cooldown in minutes.\n"
+            "Group: same bot + group + user gets one reply per window.\n"
+            "DM: same bot + user gets one reply per window.",
             reply_markup=BOT_ACCOUNT_MENU,
         )
         return

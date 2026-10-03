@@ -24,6 +24,8 @@ class Database:
         self.counters = mongo_db["tenant_counters"]
         self.bot_accounts = mongo_db["bot_accounts"]
         self.bot_reply_cooldowns = mongo_db["bot_reply_cooldowns"]
+        self.bot_account_groups = mongo_db["bot_account_groups"]
+        self.bot_account_events = mongo_db["bot_account_events"]
 
     async def init(self):
         def _init():
@@ -35,6 +37,9 @@ class Database:
             self.bot_accounts.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING)])
             self.bot_reply_cooldowns.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
             self.bot_reply_cooldowns.create_index([("updated_at", ASCENDING)])
+            self.bot_account_groups.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("chat_id", ASCENDING)], unique=True)
+            self.bot_account_groups.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("active", ASCENDING)])
+            self.bot_account_events.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("created_at", ASCENDING)])
             # Keep the post counter at least as high as the largest existing id.
             last = self.posts.find_one({"owner_id": self.owner_id}, sort=[("id", -1)], projection={"id": 1})
             max_id = int(last.get("id", 0)) if last else 0
@@ -222,7 +227,65 @@ class Database:
             self.bot_reply_cooldowns.delete_many,
             {"owner_id": self.owner_id, "bot_id": int(bot_id)},
         )
+        await asyncio.to_thread(self.bot_account_groups.delete_many, {"owner_id": self.owner_id, "bot_id": int(bot_id)})
+        await asyncio.to_thread(self.bot_account_events.delete_many, {"owner_id": self.owner_id, "bot_id": int(bot_id)})
         return bool(result.deleted_count)
+
+    async def upsert_bot_group(self, bot_id: int, chat_id: int, title: str | None = None, active: bool = True):
+        now = datetime.now(timezone.utc)
+        await asyncio.to_thread(
+            self.bot_account_groups.update_one,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id), "chat_id": int(chat_id)},
+            {"$set": {"title": title, "active": bool(active), "updated_at": now},
+             "$setOnInsert": {"created_at": now}},
+            True,
+        )
+
+    async def count_bot_groups(self, bot_id: int) -> int:
+        return await asyncio.to_thread(
+            self.bot_account_groups.count_documents,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id), "active": True},
+        )
+
+    async def list_bot_groups(self, bot_id: int, limit: int = 50):
+        def _list():
+            return list(self.bot_account_groups.find(
+                {"owner_id": self.owner_id, "bot_id": int(bot_id), "active": True}, {"_id": 0}
+            ).sort("updated_at", -1).limit(max(1, int(limit))))
+        return await asyncio.to_thread(_list)
+
+    async def record_bot_event(self, bot_id: int, event: str, scope: str, chat_id: int | None = None,
+                               user_id: int | None = None, detail: str = ""):
+        now = datetime.now(timezone.utc)
+        doc = {
+            "owner_id": self.owner_id, "bot_id": int(bot_id), "event": str(event),
+            "scope": str(scope), "chat_id": int(chat_id) if chat_id is not None else None,
+            "user_id": int(user_id) if user_id is not None else None, "detail": str(detail)[:500],
+            "created_at": now,
+        }
+        await asyncio.to_thread(self.bot_account_events.insert_one, doc)
+
+    async def bot_event_stats(self, bot_id: int):
+        def _stats():
+            q={"owner_id": self.owner_id, "bot_id": int(bot_id)}
+            out={"sent":0,"failed":0,"skipped":0,"group_sent":0,"dm_sent":0}
+            for d in self.bot_account_events.aggregate([{"$match":q},{"$group":{"_id":{"event":"$event","scope":"$scope"},"n":{"$sum":1}}}]):
+                ev=(d.get("_id") or {}).get("event")
+                sc=(d.get("_id") or {}).get("scope")
+                n=int(d.get("n",0))
+                if ev in out: out[ev]+=n
+                if ev=="sent":
+                    if sc=="group": out["group_sent"]+=n
+                    elif sc=="dm": out["dm_sent"]+=n
+            return out
+        return await asyncio.to_thread(_stats)
+
+    async def list_bot_events(self, bot_id: int | None = None, limit: int = 30):
+        def _list():
+            q={"owner_id": self.owner_id}
+            if bot_id is not None: q["bot_id"]=int(bot_id)
+            return list(self.bot_account_events.find(q,{"_id":0}).sort("created_at",-1).limit(max(1,int(limit))))
+        return await asyncio.to_thread(_list)
 
     async def bot_reply_allowed(self, bot_id: int, chat_id: int, user_id: int, cooldown_seconds: int) -> bool:
         """Atomically reserve one reply slot per bot + group + user."""
