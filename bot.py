@@ -13,9 +13,9 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient, errors, types, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import UpdateProfileRequest
 
 from database import Database, MongoSessionStore
 from pacing import AccountPacer
@@ -100,15 +101,58 @@ pacer = AccountPacer()
 
 MENU = ReplyKeyboardMarkup(
     [
-        ["➕ Add Session", "👤 Sessions"],
-        ["📝 Save Post", "📚 Manage Posts"],
-        ["⏱ Interval", "⏳ Group Delay"],
-        ["🔄 Rescan Targets", "📊 Live Stats"],
-        ["📊 Account Stats", "📜 Account Logs"],
+        ["📣 Promotion", "📝 Posts"],
+        ["👥 Accounts", "💬 Auto Reply"],
+        ["✏️ Edit/Set Bio", "📊 Monitoring"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+PROMOTION_MENU = ReplyKeyboardMarkup(
+    [
         ["▶️ Start Promo", "⏹ Stop Promo"],
-        ["📨 DM Broadcast"],
-        ["💬 Auto Reply"],
-        ["🗑 Remove Session"],
+        ["⏱ Interval", "⏳ Group Delay"],
+        ["🔄 Rescan Targets", "📨 DM Broadcast"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+ACCOUNTS_MENU = ReplyKeyboardMarkup(
+    [
+        ["➕ Add Session", "👤 Sessions"],
+        ["🤖 Bot Accounts", "🗑 Remove Session"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+MONITORING_MENU = ReplyKeyboardMarkup(
+    [
+        ["📊 Live Stats", "📊 Account Stats"],
+        ["📜 Account Logs"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+BIO_MENU = ReplyKeyboardMarkup(
+    [
+        ["🤖 Set Bot Bio", "👤 Set User Bio"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+BIO_SCOPE_MENU = ReplyKeyboardMarkup(
+    [
+        ["👤 Individual", "🌐 Set All"],
+        ["⬅️ Back"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -151,6 +195,23 @@ ADD_SESSION_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
+
+BOT_ACCOUNT_MENU = ReplyKeyboardMarkup(
+    [
+        ["➕ Add Bot", "👤 Bot Accounts"],
+        ["✏️ Group Reply", "🟢 Toggle Group Reply"],
+        ["⏱ Group Reply Cooldown", "🗑 Remove Bot"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+BOT_GROUP_REPLY_DEFAULT = os.getenv(
+    "BOT_GROUP_REPLY_TEXT",
+    "👋 Thanks for your message."
+).replace("\\n", "\n")
+BOT_GROUP_REPLY_COOLDOWN_SECONDS = max(60, int(os.getenv("BOT_GROUP_REPLY_COOLDOWN_SECONDS", "600")))
 
 login_flows: dict[int, dict] = {}
 # In-memory target cache: session Mongo ID -> {groups, users, scanned_at}.
@@ -285,6 +346,8 @@ TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
 TENANT_STATS: dict[int, RuntimeStats] = {}
 PROMO_TASKS: dict[int, asyncio.Task] = {}
 LISTENER_TASKS: dict[int, asyncio.Task] = {}
+BOT_ACCOUNT_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+BOT_ACCOUNT_STATUS: dict[tuple[int, int], str] = {}
 OPERATORS_DIR = Path(os.getenv("OPERATORS_DIR", "operators"))
 
 # Owner-only operator access list; a separate collection from encrypted sessions.
@@ -492,6 +555,198 @@ async def initialize_tenant(uid: int):
         stats.group_delay_seconds = await get_group_delay()
     finally:
         CURRENT_OPERATOR.reset(token)
+
+async def bot_group_reply_enabled_for(owner_uid: int) -> bool:
+    token = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        return (await db.get_setting("bot_group_reply_enabled", "true")).lower() in {"true", "1", "yes", "on"}
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+
+async def bot_group_reply_cooldown_for(owner_uid: int) -> int:
+    token = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        try:
+            return max(60, int(await db.get_setting(
+                "bot_group_reply_cooldown_seconds", str(BOT_GROUP_REPLY_COOLDOWN_SECONDS)
+            )))
+        except (TypeError, ValueError):
+            return BOT_GROUP_REPLY_COOLDOWN_SECONDS
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+
+async def bot_group_reply_text_for(owner_uid: int) -> str:
+    token = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        return await db.get_setting("bot_group_reply_text", BOT_GROUP_REPLY_DEFAULT)
+    finally:
+        CURRENT_OPERATOR.reset(token)
+
+
+def decrypt_bot_token(value: str) -> str:
+    try:
+        return fernet.decrypt(value.encode()).decode()
+    except (InvalidToken, AttributeError) as exc:
+        raise RuntimeError("Stored bot token cannot be decrypted with current FERNET_KEY") from exc
+
+
+async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
+    """Long-poll one connected Bot API account and reply in groups.
+
+    Cooldown is per bot + group + user and is stored in MongoDB, so a restart
+    does not reset the 10-minute window.
+    """
+    key = (int(owner_uid), int(bot_id))
+    token_ctx = CURRENT_OPERATOR.set(owner_uid)
+    api_bot = None
+    try:
+        row = await db.get_bot_account(bot_id)
+        if not row or not row.get("enabled", True):
+            return
+        token_raw = decrypt_bot_token(row["token_enc"])
+        api_bot = Bot(token=token_raw)
+        await api_bot.initialize()
+        me = await api_bot.get_me()
+        BOT_ACCOUNT_STATUS[key] = "🟢 LISTENING"
+        offset = None
+        retry_delay = 2
+        log.info("Bot account listener connected owner=%s bot_id=%s username=%s", owner_uid, bot_id, me.username)
+
+        while True:
+            row = await db.get_bot_account(bot_id)
+            if not row or not row.get("enabled", True):
+                BOT_ACCOUNT_STATUS[key] = "⚪ DISABLED"
+                return
+            try:
+                updates = await api_bot.get_updates(
+                    offset=offset,
+                    timeout=30,
+                    allowed_updates=["message"],
+                    read_timeout=40,
+                    connect_timeout=20,
+                    pool_timeout=20,
+                )
+                retry_delay = 2
+                for upd in updates:
+                    offset = upd.update_id + 1
+                    msg = upd.effective_message
+                    usr = upd.effective_user
+                    chat = upd.effective_chat
+                    if not msg or not usr or not chat:
+                        continue
+                    if chat.type not in {"group", "supergroup"}:
+                        continue
+                    # Ignore join/leave/pin/topic and other service updates; reply only to user content.
+                    if not msg.text and msg.effective_attachment is None:
+                        continue
+                    if usr.is_bot or int(usr.id) == int(bot_id):
+                        continue
+                    if not await bot_group_reply_enabled_for(owner_uid):
+                        continue
+
+                    cooldown = await bot_group_reply_cooldown_for(owner_uid)
+                    allowed = await db.bot_reply_allowed(bot_id, chat.id, usr.id, cooldown)
+                    if not allowed:
+                        continue
+
+                    try:
+                        reply_text = await bot_group_reply_text_for(owner_uid)
+                        if not reply_text.strip():
+                            await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                            continue
+                        await api_bot.send_message(
+                            chat_id=chat.id,
+                            text=reply_text,
+                            reply_to_message_id=msg.message_id,
+                            allow_sending_without_reply=False,
+                            disable_web_page_preview=True,
+                        )
+                    except RetryAfter as exc:
+                        await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        await asyncio.sleep(float(exc.retry_after) + 1.0)
+                    except (Forbidden, BadRequest) as exc:
+                        # No send permission / deleted message / restricted bot.
+                        await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        log.info(
+                            "Bot group reply skipped owner=%s bot_id=%s chat=%s: %s",
+                            owner_uid, bot_id, chat.id, type(exc).__name__,
+                        )
+                    except (NetworkError, TimedOut):
+                        await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                    except TelegramError as exc:
+                        await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        log.warning(
+                            "Bot group reply failed owner=%s bot_id=%s chat=%s: %s",
+                            owner_uid, bot_id, chat.id, type(exc).__name__,
+                        )
+            except Conflict:
+                BOT_ACCOUNT_STATUS[key] = "⚠️ POLLING CONFLICT"
+                # Usually means the same bot token is running elsewhere or has another getUpdates consumer.
+                await asyncio.sleep(30)
+            except RetryAfter as exc:
+                BOT_ACCOUNT_STATUS[key] = f"⏳ FLOODWAIT {int(exc.retry_after)}s"
+                await asyncio.sleep(float(exc.retry_after) + 1.0)
+            except (NetworkError, TimedOut):
+                BOT_ACCOUNT_STATUS[key] = "🟡 RECONNECTING"
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30, retry_delay * 2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
+                log.warning("Bot account listener error owner=%s bot_id=%s: %s", owner_uid, bot_id, type(exc).__name__)
+                await asyncio.sleep(min(30, retry_delay))
+                retry_delay = min(30, retry_delay * 2)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
+        log.warning("Bot account failed owner=%s bot_id=%s: %s", owner_uid, bot_id, type(exc).__name__)
+    finally:
+        if api_bot is not None:
+            try:
+                await api_bot.shutdown()
+            except Exception:
+                pass
+        BOT_ACCOUNT_TASKS.pop(key, None)
+        CURRENT_OPERATOR.reset(token_ctx)
+
+
+async def start_bot_account_listener(app: Application, owner_uid: int, bot_id: int):
+    key = (int(owner_uid), int(bot_id))
+    old = BOT_ACCOUNT_TASKS.get(key)
+    if old and not old.done():
+        return
+    BOT_ACCOUNT_TASKS[key] = asyncio.create_task(
+        _bot_account_listener(app, owner_uid, bot_id),
+        name=f"bot-account-{owner_uid}-{bot_id}",
+    )
+
+
+async def stop_bot_account_listener(owner_uid: int, bot_id: int):
+    key = (int(owner_uid), int(bot_id))
+    task = BOT_ACCOUNT_TASKS.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    BOT_ACCOUNT_STATUS[key] = "⚪ DISABLED"
+
+
+async def sync_bot_account_listeners(app: Application, owner_uid: int):
+    token_ctx = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        rows = await db.list_bot_accounts()
+        wanted = {int(r["bot_id"]) for r in rows if r.get("enabled", True)}
+    finally:
+        CURRENT_OPERATOR.reset(token_ctx)
+    for bid in wanted:
+        await start_bot_account_listener(app, owner_uid, bid)
+    for (uid, bid), task in list(BOT_ACCOUNT_TASKS.items()):
+        if uid == owner_uid and bid not in wanted:
+            await stop_bot_account_listener(uid, bid)
+
 
 async def start_tenant_listener(app, uid: int):
     task = LISTENER_TASKS.get(uid)
@@ -1790,7 +2045,8 @@ async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"_id": uid}, {"$set": {"approved_by": ADMIN_ID, "approved_at": time.time()}}, upsert=True))
         APPROVED_USERS.add(uid)
         await start_tenant_listener(context.application, uid)
-        await update.message.reply_text(f"✅ Added {uid}. Their sessions, posts, media and jobs are separate.\n\nThey can now open /start.")
+        await sync_bot_account_listeners(context.application, uid)
+        await update.message.reply_text(f"✅ Added {uid}. Their sessions, bot accounts, posts, media and jobs are separate.\n\nThey can now open /start.")
         try:
             await context.bot.send_message(uid, "✅ The owner has granted you access. Open /start to begin.")
         except Exception:
@@ -1814,6 +2070,9 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = tenant_stats(uid)
     st.running = False
     tasks = [PROMO_TASKS.pop(uid, None), LISTENER_TASKS.pop(uid, None)]
+    tasks.extend([task for (owner_uid, _), task in list(BOT_ACCOUNT_TASKS.items()) if owner_uid == uid])
+    for key in [key for key in list(BOT_ACCOUNT_TASKS) if key[0] == uid]:
+        BOT_ACCOUNT_TASKS.pop(key, None)
     tasks.append(context.application.bot_data.pop(f"dm_broadcast_task:{uid}", None))
     context.application.bot_data[f"dm_broadcast_running:{uid}"] = False
     for task in tasks:
@@ -1844,7 +2103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return await bot_dm_auto_reply(update, context)
     await update.message.reply_text(
-        "📢 <b>Promotion Bot</b>\n\nUse the menu below. Joined groups/supergroups are cached so every promo round does not rescan dialogs. Recurring scheduler targets joined groups only. Use 📨 DM Broadcast for a one-time send only to private users this account has already messaged before.",
+        "📢 <b>Promotion Bot</b>\n\nChoose a category below. Promotion, accounts, replies, bio tools and monitoring are grouped to keep the main screen clean.",
         parse_mode=ParseMode.HTML,
         reply_markup=MENU,
     )
@@ -1890,8 +2149,158 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = state.get(uid)
     if text == "⬅️ Back":
         state.pop(uid, None)
+        context.user_data.pop("bio_kind", None)
+        context.user_data.pop("bio_mode", None)
+        context.user_data.pop("bio_target", None)
         await cleanup_login_flow(uid)
         await update.message.reply_text("Main menu.", reply_markup=MENU)
+        return
+
+    # Clean category navigation from the main page.
+    if text == "📣 Promotion":
+        state.pop(uid, None)
+        await update.message.reply_text("📣 <b>PROMOTION</b>", parse_mode=ParseMode.HTML, reply_markup=PROMOTION_MENU)
+        return
+    if text == "📝 Posts":
+        state.pop(uid, None)
+        await update.message.reply_text(await posts_summary(), parse_mode=ParseMode.HTML, reply_markup=POST_MENU)
+        return
+    if text == "👥 Accounts":
+        state.pop(uid, None)
+        await update.message.reply_text("👥 <b>ACCOUNTS</b>", parse_mode=ParseMode.HTML, reply_markup=ACCOUNTS_MENU)
+        return
+    if text == "📊 Monitoring":
+        state.pop(uid, None)
+        await update.message.reply_text("📊 <b>MONITORING</b>", parse_mode=ParseMode.HTML, reply_markup=MONITORING_MENU)
+        return
+    if text == "✏️ Edit/Set Bio":
+        state.pop(uid, None)
+        context.user_data.pop("bio_kind", None)
+        context.user_data.pop("bio_mode", None)
+        context.user_data.pop("bio_target", None)
+        await update.message.reply_text(
+            "✏️ <b>EDIT / SET BIO</b>\n\nWhose bio do you want to change?",
+            parse_mode=ParseMode.HTML, reply_markup=BIO_MENU,
+        )
+        return
+    if text in {"🤖 Set Bot Bio", "👤 Set User Bio"}:
+        kind = "bot" if text.startswith("🤖") else "user"
+        context.user_data["bio_kind"] = kind
+        context.user_data.pop("bio_mode", None)
+        context.user_data.pop("bio_target", None)
+        await update.message.reply_text(
+            ("🤖 <b>BOT BIO</b>" if kind == "bot" else "👤 <b>USER BIO</b>") +
+            "\n\nChoose whether to update one account or all active accounts.",
+            parse_mode=ParseMode.HTML, reply_markup=BIO_SCOPE_MENU,
+        )
+        return
+    if text == "👤 Individual" and context.user_data.get("bio_kind") in {"bot", "user"}:
+        kind = context.user_data["bio_kind"]
+        buttons = []
+        if kind == "user":
+            rows = await session_store.get_sessions(enabled_only=True)
+            active_rows = []
+            for row in rows:
+                try:
+                    client = await get_account_client(row)
+                    if client and client.is_connected():
+                        active_rows.append(row)
+                except Exception:
+                    continue
+            for row in active_rows:
+                tg_id = row.get("tg_user_id")
+                if tg_id is None:
+                    continue
+                label = row.get("first_name") or row.get("label") or row.get("username") or str(tg_id)
+                buttons.append([InlineKeyboardButton(str(label)[:40], callback_data=f"bio_pick:user:{int(tg_id)}")])
+        else:
+            rows = await db.list_bot_accounts(enabled_only=True)
+            for row in rows:
+                bid = int(row["bot_id"])
+                status = BOT_ACCOUNT_STATUS.get((uid, bid), "")
+                if not status.startswith("🟢"):
+                    continue
+                label = row.get("first_name") or ("@" + row.get("username") if row.get("username") else str(bid))
+                buttons.append([InlineKeyboardButton(str(label)[:40], callback_data=f"bio_pick:bot:{bid}")])
+        if not buttons:
+            await update.message.reply_text(
+                "❌ No active connected account available for individual bio update.",
+                reply_markup=BIO_SCOPE_MENU,
+            )
+            return
+        await update.message.reply_text(
+            "Select an active connected account:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+    if text == "🌐 Set All" and context.user_data.get("bio_kind") in {"bot", "user"}:
+        context.user_data["bio_mode"] = "all"
+        context.user_data.pop("bio_target", None)
+        state[uid] = "await_bio_text"
+        kind_label = "bot accounts" if context.user_data["bio_kind"] == "bot" else "user accounts"
+        await update.message.reply_text(
+            f"Send the new bio for all active {kind_label}.\n\nSend <code>CLEAR</code> to remove the bio.",
+            parse_mode=ParseMode.HTML, reply_markup=BIO_SCOPE_MENU,
+        )
+        return
+
+    if current == "await_bio_text":
+        kind = context.user_data.get("bio_kind")
+        mode = context.user_data.get("bio_mode")
+        target = context.user_data.get("bio_target")
+        bio_text = "" if text.strip().upper() == "CLEAR" else text.strip()
+        if kind == "bot" and len(bio_text) > 120:
+            await update.message.reply_text("❌ Bot bio can be at most 120 characters. Send a shorter bio.", reply_markup=BIO_SCOPE_MENU)
+            return
+        if not kind or mode not in {"one", "all"}:
+            state.pop(uid, None)
+            await update.message.reply_text("Bio flow expired. Open ✏️ Edit/Set Bio again.", reply_markup=MENU)
+            return
+
+        results = []
+        if kind == "bot":
+            rows = await db.list_bot_accounts(enabled_only=True)
+            if mode == "one":
+                rows = [r for r in rows if int(r.get("bot_id", 0)) == int(target or 0)]
+            else:
+                rows = [r for r in rows if BOT_ACCOUNT_STATUS.get((uid, int(r["bot_id"])), "").startswith("🟢")]
+            for row in rows:
+                bid = int(row["bot_id"])
+                label = row.get("first_name") or ("@" + row.get("username") if row.get("username") else str(bid))
+                try:
+                    token_value = decrypt_bot_token(row["token_enc"])
+                    api_bot = Bot(token=token_value)
+                    await api_bot.set_my_short_description(short_description=bio_text)
+                    results.append((label, True, ""))
+                except Exception as exc:
+                    results.append((label, False, type(exc).__name__))
+        else:
+            rows = await session_store.get_sessions(enabled_only=True)
+            if mode == "one":
+                rows = [r for r in rows if int(r.get("tg_user_id") or 0) == int(target or 0)]
+            for row in rows:
+                label = row.get("first_name") or row.get("label") or row.get("username") or str(row.get("tg_user_id"))
+                try:
+                    client = await get_account_client(row)
+                    if not client.is_connected():
+                        raise RuntimeError("NotConnected")
+                    await client(UpdateProfileRequest(about=bio_text))
+                    results.append((label, True, ""))
+                except Exception as exc:
+                    results.append((label, False, type(exc).__name__))
+
+        state.pop(uid, None)
+        context.user_data.pop("bio_mode", None)
+        context.user_data.pop("bio_target", None)
+        ok = sum(1 for _, success, _ in results if success)
+        failed = [(label, err) for label, success, err in results if not success]
+        lines = [f"✅ Bio updated: <b>{ok}</b>"]
+        if failed:
+            lines.append(f"⚠️ Failed: <b>{len(failed)}</b>")
+            lines.extend(f"• {esc(label)} — <code>{esc(err)}</code>" for label, err in failed[:10])
+        if not results:
+            lines = ["❌ No active account matched this bio update."]
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=BIO_MENU)
         return
 
     if current in {"await_account_reply", "await_control_reply"}:
@@ -2215,6 +2624,83 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
 
+    if current == "await_bot_token":
+        token_raw = text.strip()
+        await safe_delete_message(update.message)
+        try:
+            if token_raw == BOT_TOKEN:
+                raise ValueError("The control bot token cannot be added as a Bot Account.")
+            test_bot = Bot(token=token_raw)
+            await test_bot.initialize()
+            try:
+                me = await test_bot.get_me()
+            finally:
+                await test_bot.shutdown()
+            if not me.is_bot:
+                raise ValueError("This token does not belong to a bot account.")
+            enc = fernet.encrypt(token_raw.encode()).decode()
+            await db.add_bot_account(me.id, me.username, me.first_name, enc)
+            state.pop(uid, None)
+            await start_bot_account_listener(context.application, uid, me.id)
+            await context.bot.send_message(
+                uid,
+                f"✅ <b>BOT ACCOUNT ADDED</b>\n\n"
+                f"🤖 {esc(me.first_name or 'Bot')}\n"
+                f"👤 @{esc(me.username or 'no_username')}\n"
+                f"🆔 <code>{me.id}</code>\n\n"
+                "For replies to every normal group message while the bot is not admin, disable Privacy Mode in @BotFather → /setprivacy for this bot. "
+                "The bot must still be a member and allowed to send messages.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=BOT_ACCOUNT_MENU,
+            )
+        except Exception as exc:
+            state[uid] = "await_bot_token"
+            await context.bot.send_message(
+                uid,
+                f"❌ Bot token validation failed: <code>{esc(type(exc).__name__ + ': ' + str(exc))}</code>\n\nSend a valid bot token or press Back.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=BOT_ACCOUNT_MENU,
+            )
+        return
+
+    if current == "await_bot_group_reply_text":
+        await db.set_setting("bot_group_reply_text", text)
+        state.pop(uid, None)
+        await update.message.reply_text("✅ Group reply message saved.", reply_markup=BOT_ACCOUNT_MENU)
+        return
+
+    if current == "await_bot_group_reply_cooldown":
+        try:
+            minutes = int(text.strip())
+            if not 1 <= minutes <= 1440:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Send cooldown in whole minutes (1–1440).", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        await db.set_setting("bot_group_reply_cooldown_seconds", str(minutes * 60))
+        state.pop(uid, None)
+        await update.message.reply_text(
+            f"✅ Same user will receive at most one reply every {minutes} minute(s) in the same group.",
+            reply_markup=BOT_ACCOUNT_MENU,
+        )
+        return
+
+    if current == "await_remove_bot":
+        try:
+            bot_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("Send the numeric bot ID shown in Bot Accounts.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        row = await db.get_bot_account(bot_id)
+        if not row:
+            await update.message.reply_text("❌ Bot account not found.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        await stop_bot_account_listener(uid, bot_id)
+        await db.delete_bot_account(bot_id)
+        state.pop(uid, None)
+        await update.message.reply_text(f"✅ Bot @{row.get('username') or bot_id} removed.", reply_markup=BOT_ACCOUNT_MENU)
+        return
+
     if current == "await_group_delay":
         try:
             seconds = int(text.strip())
@@ -2251,7 +2737,90 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Session not found")
             await update.message.reply_text(f"✅ Session {session_ref} removed.", reply_markup=MENU)
         except Exception:
-            await update.message.reply_text("❌ Send the Mongo session ID shown in Sessions, or its numeric Telegram user ID.", reply_markup=MENU)
+            await update.message.reply_text("❌ Send the Mongo session ID shown in Sessions, or its numeric Telegram user ID.", reply_markup=ACCOUNTS_MENU)
+        return
+
+    if text == "🤖 Bot Accounts":
+        enabled = (await db.get_setting("bot_group_reply_enabled", "true")).lower() in {"true", "1", "yes", "on"}
+        cooldown = await bot_group_reply_cooldown_for(uid)
+        rows = await db.list_bot_accounts()
+        await update.message.reply_text(
+            "🤖 <b>BOT ACCOUNT MODE</b>\n\n"
+            f"Group reply: <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"Cooldown: <b>{cooldown // 60} min per user, per group</b>\n"
+            f"Connected bot accounts: <b>{len(rows)}</b>\n\n"
+            "A bot does not need to be group admin to send a reply if normal sending is allowed. "
+            "To receive every ordinary group message without admin rights, disable the bot's Privacy Mode in @BotFather (/setprivacy).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=BOT_ACCOUNT_MENU,
+        )
+        return
+
+    if text == "➕ Add Bot":
+        state[uid] = "await_bot_token"
+        await update.message.reply_text(
+            "Send the Telegram bot token from @BotFather.\n\n"
+            "It will be validated, encrypted with the existing FERNET_KEY, and stored in this operator's MongoDB scope.",
+            reply_markup=BOT_ACCOUNT_MENU,
+        )
+        return
+
+    if text == "👤 Bot Accounts":
+        rows = await db.list_bot_accounts()
+        if not rows:
+            await update.message.reply_text("No bot accounts added.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        lines = ["🤖 <b>BOT ACCOUNTS</b>\n"]
+        for row in rows:
+            bid = int(row["bot_id"])
+            status = BOT_ACCOUNT_STATUS.get((uid, bid), "🟡 STARTING" if row.get("enabled", True) else "⚪ DISABLED")
+            uname = f"@{row.get('username')}" if row.get("username") else "no username"
+            lines.append(
+                f"{status} • <b>{esc(row.get('first_name') or uname)}</b>\n"
+                f"{esc(uname)} • ID <code>{bid}</code>"
+            )
+        await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
+        return
+
+    if text == "✏️ Group Reply":
+        current_reply = await db.get_setting("bot_group_reply_text", BOT_GROUP_REPLY_DEFAULT)
+        state[uid] = "await_bot_group_reply_text"
+        await update.message.reply_text(
+            f"Current group reply:\n\n{current_reply}\n\nSend the new reply text.",
+            reply_markup=BOT_ACCOUNT_MENU,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if text == "🟢 Toggle Group Reply":
+        enabled = (await db.get_setting("bot_group_reply_enabled", "true")).lower() in {"true", "1", "yes", "on"}
+        await db.set_setting("bot_group_reply_enabled", "false" if enabled else "true")
+        await update.message.reply_text(
+            f"✅ Group reply is now {'OFF' if enabled else 'ON'}.",
+            reply_markup=BOT_ACCOUNT_MENU,
+        )
+        return
+
+    if text == "⏱ Group Reply Cooldown":
+        current_cd = await bot_group_reply_cooldown_for(uid)
+        state[uid] = "await_bot_group_reply_cooldown"
+        await update.message.reply_text(
+            f"Current cooldown: {current_cd // 60} minute(s).\n\n"
+            "Send new cooldown in minutes. Same user + same group gets one reply per cooldown window.",
+            reply_markup=BOT_ACCOUNT_MENU,
+        )
+        return
+
+    if text == "🗑 Remove Bot":
+        rows = await db.list_bot_accounts()
+        if not rows:
+            await update.message.reply_text("No bot accounts to remove.", reply_markup=BOT_ACCOUNT_MENU)
+            return
+        state[uid] = "await_remove_bot"
+        lines = ["Send the numeric bot ID to remove:"] + [
+            f"{int(r['bot_id'])} — @{r.get('username') or 'no_username'}" for r in rows
+        ]
+        await update.message.reply_text("\n".join(lines), reply_markup=BOT_ACCOUNT_MENU)
         return
 
     if text == "➕ Add Session":
@@ -2491,6 +3060,57 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text(f"❌ Could not save post:\n{type(e).__name__}: {e}", reply_markup=MENU)
 
 
+async def bio_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    await q.answer()
+    try:
+        _, kind, raw_id = q.data.split(":", 2)
+        target_id = int(raw_id)
+    except (ValueError, TypeError):
+        return
+    if kind not in {"bot", "user"}:
+        return
+
+    uid = update.effective_user.id
+    context.user_data["bio_kind"] = kind
+    context.user_data["bio_mode"] = "one"
+    context.user_data["bio_target"] = target_id
+    state[uid] = "await_bio_text"
+
+    label = str(target_id)
+    if kind == "bot":
+        row = await db.get_bot_account(target_id)
+        if not row or not row.get("enabled", True):
+            state.pop(uid, None)
+            return await q.edit_message_text("❌ This bot account is no longer active.")
+        status = BOT_ACCOUNT_STATUS.get((uid, target_id), "")
+        if not status.startswith("🟢"):
+            state.pop(uid, None)
+            return await q.edit_message_text("❌ This bot account is not currently connected/listening.")
+        label = row.get("first_name") or ("@" + row.get("username") if row.get("username") else str(target_id))
+    else:
+        rows = await session_store.get_sessions(enabled_only=True)
+        row = next((r for r in rows if int(r.get("tg_user_id") or 0) == target_id), None)
+        if not row:
+            state.pop(uid, None)
+            return await q.edit_message_text("❌ This user account is no longer active.")
+        try:
+            client = await get_account_client(row)
+            if not client.is_connected():
+                raise RuntimeError("not connected")
+        except Exception:
+            state.pop(uid, None)
+            return await q.edit_message_text("❌ This user account is not currently connected.")
+        label = row.get("first_name") or row.get("label") or row.get("username") or str(target_id)
+
+    await q.edit_message_text(
+        f"✏️ Selected: <b>{esc(label)}</b>\n\nSend the new bio now.\nSend <code>CLEAR</code> to remove the bio.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def session_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2551,12 +3171,13 @@ async def post_init(app: Application):
     for uid in sorted(APPROVED_USERS):
         await initialize_tenant(uid)
         await start_tenant_listener(app, uid)
+        await sync_bot_account_listeners(app, uid)
 
 
 async def post_shutdown(app: Application):
     for st in TENANT_STATS.values():
         st.running = False
-    jobs = list(PROMO_TASKS.values()) + list(LISTENER_TASKS.values())
+    jobs = list(PROMO_TASKS.values()) + list(LISTENER_TASKS.values()) + list(BOT_ACCOUNT_TASKS.values())
     jobs += [value for key, value in app.bot_data.items() if key.startswith("dm_broadcast_task:") and value]
     for task in jobs:
         if task and not task.done():
@@ -2564,6 +3185,7 @@ async def post_shutdown(app: Application):
     await asyncio.gather(*(task for task in jobs if task), return_exceptions=True)
     PROMO_TASKS.clear()
     LISTENER_TASKS.clear()
+    BOT_ACCOUNT_TASKS.clear()
     await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
                          return_exceptions=True)
     for store in TENANT_SESSIONS.values():
@@ -2581,6 +3203,7 @@ def main():
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
     app.add_handler(CommandHandler("start", authorized_handler(start)))
+    app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_cancel), pattern=r"^sess_rm_no:[0-9a-fA-F]+$"))

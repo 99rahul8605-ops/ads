@@ -22,6 +22,8 @@ class Database:
         self.settings = mongo_db["tenant_settings"]
         self.posts = mongo_db["promo_posts"]
         self.counters = mongo_db["tenant_counters"]
+        self.bot_accounts = mongo_db["bot_accounts"]
+        self.bot_reply_cooldowns = mongo_db["bot_reply_cooldowns"]
 
     async def init(self):
         def _init():
@@ -29,6 +31,10 @@ class Database:
             self.settings.create_index([("owner_id", ASCENDING), ("key", ASCENDING)], unique=True)
             self.posts.create_index([("owner_id", ASCENDING), ("id", ASCENDING)], unique=True)
             self.posts.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING), ("id", ASCENDING)])
+            self.bot_accounts.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING)], unique=True)
+            self.bot_accounts.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING)])
+            self.bot_reply_cooldowns.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+            self.bot_reply_cooldowns.create_index([("updated_at", ASCENDING)])
             # Keep the post counter at least as high as the largest existing id.
             last = self.posts.find_one({"owner_id": self.owner_id}, sort=[("id", -1)], projection={"id": 1})
             max_id = int(last.get("id", 0)) if last else 0
@@ -163,6 +169,95 @@ class Database:
 
         cursor = await asyncio.to_thread(_next_cursor)
         return posts[cursor % len(posts)]
+
+    async def add_bot_account(self, bot_id: int, username: str | None, first_name: str | None, token_enc: str):
+        now = datetime.now(timezone.utc)
+        def _add():
+            self.bot_accounts.update_one(
+                {"owner_id": self.owner_id, "bot_id": int(bot_id)},
+                {"$set": {
+                    "username": username,
+                    "first_name": first_name,
+                    "token_enc": token_enc,
+                    "enabled": True,
+                    "updated_at": now,
+                }, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+            return self.bot_accounts.find_one(
+                {"owner_id": self.owner_id, "bot_id": int(bot_id)}, {"_id": 0}
+            )
+        return await asyncio.to_thread(_add)
+
+    async def list_bot_accounts(self, enabled_only: bool = False):
+        def _list():
+            q = {"owner_id": self.owner_id}
+            if enabled_only:
+                q["enabled"] = True
+            docs = list(self.bot_accounts.find(q, {"_id": 0}).sort("created_at", ASCENDING))
+            return docs
+        return await asyncio.to_thread(_list)
+
+    async def get_bot_account(self, bot_id: int):
+        return await asyncio.to_thread(
+            self.bot_accounts.find_one,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id)},
+            {"_id": 0},
+        )
+
+    async def set_bot_account_enabled(self, bot_id: int, enabled: bool):
+        result = await asyncio.to_thread(
+            self.bot_accounts.update_one,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id)},
+            {"$set": {"enabled": bool(enabled), "updated_at": datetime.now(timezone.utc)}},
+        )
+        return bool(result.matched_count)
+
+    async def delete_bot_account(self, bot_id: int):
+        result = await asyncio.to_thread(
+            self.bot_accounts.delete_one,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id)},
+        )
+        await asyncio.to_thread(
+            self.bot_reply_cooldowns.delete_many,
+            {"owner_id": self.owner_id, "bot_id": int(bot_id)},
+        )
+        return bool(result.deleted_count)
+
+    async def bot_reply_allowed(self, bot_id: int, chat_id: int, user_id: int, cooldown_seconds: int) -> bool:
+        """Atomically reserve one reply slot per bot + group + user."""
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+        cutoff = now - timedelta(seconds=max(1, int(cooldown_seconds)))
+
+        def _reserve():
+            key = {
+                "owner_id": self.owner_id,
+                "bot_id": int(bot_id),
+                "chat_id": int(chat_id),
+                "user_id": int(user_id),
+            }
+            doc = self.bot_reply_cooldowns.find_one(key, {"updated_at": 1})
+            if doc and doc.get("updated_at") and doc["updated_at"] > cutoff:
+                return False
+            self.bot_reply_cooldowns.update_one(
+                key,
+                {"$set": {"updated_at": now}, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+            return True
+        return await asyncio.to_thread(_reserve)
+
+    async def release_bot_reply_slot(self, bot_id: int, chat_id: int, user_id: int):
+        await asyncio.to_thread(
+            self.bot_reply_cooldowns.delete_one,
+            {
+                "owner_id": self.owner_id,
+                "bot_id": int(bot_id),
+                "chat_id": int(chat_id),
+                "user_id": int(user_id),
+            },
+        )
 
 
 class MongoSessionStore:
