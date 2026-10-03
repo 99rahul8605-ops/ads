@@ -786,14 +786,14 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                 raise
             except Exception as exc:
                 BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
-                log.warning("Bot account listener error owner=%s bot_id=%s: %s", owner_uid, bot_id, type(exc).__name__)
+                log.warning("Bot account listener error owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
                 await asyncio.sleep(min(30, retry_delay))
                 retry_delay = min(30, retry_delay * 2)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
-        log.warning("Bot account failed owner=%s bot_id=%s: %s", owner_uid, bot_id, type(exc).__name__)
+        log.warning("Bot account failed owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
     finally:
         if api_bot is not None:
             try:

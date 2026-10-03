@@ -238,7 +238,7 @@ class Database:
             {"owner_id": self.owner_id, "bot_id": int(bot_id), "chat_id": int(chat_id)},
             {"$set": {"title": title, "active": bool(active), "updated_at": now},
              "$setOnInsert": {"created_at": now}},
-            True,
+            upsert=True,
         )
 
     async def count_bot_groups(self, bot_id: int) -> int:
