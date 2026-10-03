@@ -17,7 +17,7 @@ class Database:
         self.uri = uri
         self.db_name = db_name
         self.owner_id = int(owner_id)
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=10000, tz_aware=True)
         mongo_db = self.client[db_name]
         self.settings = mongo_db["tenant_settings"]
         self.posts = mongo_db["promo_posts"]
@@ -301,8 +301,16 @@ class Database:
                 "user_id": int(user_id),
             }
             doc = self.bot_reply_cooldowns.find_one(key, {"updated_at": 1})
-            if doc and doc.get("updated_at") and doc["updated_at"] > cutoff:
-                return False
+            if doc and doc.get("updated_at"):
+                previous = doc["updated_at"]
+                # PyMongo may return legacy BSON datetimes as offset-naive UTC.
+                # Normalize before comparing with the timezone-aware cutoff.
+                if previous.tzinfo is None:
+                    previous = previous.replace(tzinfo=timezone.utc)
+                else:
+                    previous = previous.astimezone(timezone.utc)
+                if previous > cutoff:
+                    return False
             self.bot_reply_cooldowns.update_one(
                 key,
                 {"$set": {"updated_at": now}, "$setOnInsert": {"created_at": now}},
@@ -333,7 +341,7 @@ class MongoSessionStore:
     def __init__(self, uri: str, db_name: str = "promo_bot", owner_id: int | None = None, primary_owner: bool = False):
         self.uri = uri
         self.db_name = db_name
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=10000, tz_aware=True)
         self.collection = self.client[db_name]["sessions"]
         self.owner_id = owner_id
         self.primary_owner = primary_owner
