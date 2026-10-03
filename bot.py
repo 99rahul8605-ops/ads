@@ -557,6 +557,13 @@ async def initialize_tenant(uid: int):
     finally:
         CURRENT_OPERATOR.reset(token)
 
+def retry_after_seconds(value) -> float:
+    """Normalize PTB RetryAfter value (number or timedelta) to seconds."""
+    if hasattr(value, "total_seconds"):
+        return max(0.0, float(value.total_seconds()))
+    return max(0.0, float(value))
+
+
 async def bot_group_reply_enabled_for(owner_uid: int) -> bool:
     token = CURRENT_OPERATOR.set(owner_uid)
     try:
@@ -749,8 +756,8 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                             await db.record_bot_event(bot_id, "sent", scope, chat.id, usr.id, f"post#{post.get('id', '?')}")
                     except RetryAfter as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
-                        await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, f"RetryAfter {int(exc.retry_after)}s")
-                        await asyncio.sleep(float(exc.retry_after) + 1.0)
+                        await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, f"RetryAfter {int(retry_after_seconds(exc.retry_after))}s")
+                        await asyncio.sleep(retry_after_seconds(exc.retry_after) + 1.0)
                     except (Forbidden, BadRequest) as exc:
                         # No send permission / deleted message / blocked bot.
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
@@ -762,6 +769,15 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                     except (NetworkError, TimedOut) as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                         await db.record_bot_event(bot_id, "failed", scope, chat.id, usr.id, type(exc).__name__)
+                    except (TypeError, ValueError, FileNotFoundError) as exc:
+                        # Saved-post formatting/media problems must not kill the whole bot listener.
+                        await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                        detail = f"{type(exc).__name__}: {exc}"[:500]
+                        await db.record_bot_event(bot_id, "failed", scope, chat.id, usr.id, detail)
+                        log.warning(
+                            "Bot %s reply data error owner=%s bot_id=%s chat=%s: %s",
+                            scope, owner_uid, bot_id, chat.id, detail,
+                        )
                     except TelegramError as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                         await db.record_bot_event(bot_id, "failed", scope, chat.id, usr.id, type(exc).__name__)
@@ -776,8 +792,8 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                 await db.record_bot_event(bot_id, "failed", "listener", 0, None, "Polling conflict: token used elsewhere")
                 await asyncio.sleep(30)
             except RetryAfter as exc:
-                BOT_ACCOUNT_STATUS[key] = f"⏳ FLOODWAIT {int(exc.retry_after)}s"
-                await asyncio.sleep(float(exc.retry_after) + 1.0)
+                BOT_ACCOUNT_STATUS[key] = f"⏳ FLOODWAIT {int(retry_after_seconds(exc.retry_after))}s"
+                await asyncio.sleep(retry_after_seconds(exc.retry_after) + 1.0)
             except (NetworkError, TimedOut):
                 BOT_ACCOUNT_STATUS[key] = "🟡 RECONNECTING"
                 await asyncio.sleep(retry_delay)
@@ -786,7 +802,7 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                 raise
             except Exception as exc:
                 BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
-                log.warning("Bot account listener error owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
+                log.exception("Bot account listener error owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
                 await asyncio.sleep(min(30, retry_delay))
                 retry_delay = min(30, retry_delay * 2)
     except asyncio.CancelledError:
