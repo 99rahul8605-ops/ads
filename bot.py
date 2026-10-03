@@ -199,8 +199,8 @@ ADD_SESSION_MENU = ReplyKeyboardMarkup(
 BOT_ACCOUNT_MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Bot", "👤 Bot Accounts"],
-        ["✏️ Group Reply", "🟢 Toggle Group Reply"],
-        ["⏱ Group Reply Cooldown", "🗑 Remove Bot"],
+        ["🟢 Toggle Group Reply", "⏱ Group Reply Cooldown"],
+        ["🗑 Remove Bot"],
         ["⬅️ Back"],
     ],
     resize_keyboard=True,
@@ -577,12 +577,47 @@ async def bot_group_reply_cooldown_for(owner_uid: int) -> int:
         CURRENT_OPERATOR.reset(token)
 
 
-async def bot_group_reply_text_for(owner_uid: int) -> str:
+async def bot_group_reply_post_for(owner_uid: int):
+    """Return the next enabled saved promotion post for bot group replies."""
     token = CURRENT_OPERATOR.set(owner_uid)
     try:
-        return await db.get_setting("bot_group_reply_text", BOT_GROUP_REPLY_DEFAULT)
+        mode = await db.get_setting("post_mode", "rotate")
+        if mode not in {"rotate", "random"}:
+            mode = "rotate"
+        return await db.next_reply_post(mode)
     finally:
         CURRENT_OPERATOR.reset(token)
+
+
+async def send_bot_saved_post_reply(api_bot: Bot, chat_id: int, reply_to_message_id: int, post: dict):
+    """Send one saved promotion post as an actual reply via the connected bot account."""
+    caption = post.get("html_text") or None
+    media_path = post.get("media_path")
+    common = dict(
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+        allow_sending_without_reply=False,
+    )
+    if media_path:
+        if not Path(media_path).exists():
+            raise FileNotFoundError(f"Saved media missing: {media_path}")
+        with open(media_path, "rb") as fh:
+            kind = post.get("kind")
+            if kind == "photo":
+                return await api_bot.send_photo(photo=fh, caption=caption, parse_mode=ParseMode.HTML, **common)
+            if kind == "video":
+                return await api_bot.send_video(video=fh, caption=caption, parse_mode=ParseMode.HTML, **common)
+            if kind == "animation":
+                return await api_bot.send_animation(animation=fh, caption=caption, parse_mode=ParseMode.HTML, **common)
+            return await api_bot.send_document(document=fh, caption=caption, parse_mode=ParseMode.HTML, **common)
+    if not caption:
+        raise ValueError("Saved promotion post is empty")
+    return await api_bot.send_message(
+        text=caption,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        **common,
+    )
 
 
 def decrypt_bot_token(value: str) -> str:
@@ -652,17 +687,11 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                         continue
 
                     try:
-                        reply_text = await bot_group_reply_text_for(owner_uid)
-                        if not reply_text.strip():
+                        post = await bot_group_reply_post_for(owner_uid)
+                        if not post:
                             await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                             continue
-                        await api_bot.send_message(
-                            chat_id=chat.id,
-                            text=reply_text,
-                            reply_to_message_id=msg.message_id,
-                            allow_sending_without_reply=False,
-                            disable_web_page_preview=True,
-                        )
+                        await send_bot_saved_post_reply(api_bot, chat.id, msg.message_id, post)
                     except RetryAfter as exc:
                         await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                         await asyncio.sleep(float(exc.retry_after) + 1.0)
@@ -2663,12 +2692,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if current == "await_bot_group_reply_text":
-        await db.set_setting("bot_group_reply_text", text)
-        state.pop(uid, None)
-        await update.message.reply_text("✅ Group reply message saved.", reply_markup=BOT_ACCOUNT_MENU)
-        return
-
     if current == "await_bot_group_reply_cooldown":
         try:
             minutes = int(text.strip())
@@ -2749,6 +2772,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Group reply: <b>{'ON' if enabled else 'OFF'}</b>\n"
             f"Cooldown: <b>{cooldown // 60} min per user, per group</b>\n"
             f"Connected bot accounts: <b>{len(rows)}</b>\n\n"
+            "Replies use the same enabled promotion posts saved in 📝 Posts and follow the current Rotate/Random post mode.\n\n"
             "A bot does not need to be group admin to send a reply if normal sending is allowed. "
             "To receive every ordinary group message without admin rights, disable the bot's Privacy Mode in @BotFather (/setprivacy).",
             parse_mode=ParseMode.HTML,
@@ -2780,16 +2804,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{esc(uname)} • ID <code>{bid}</code>"
             )
         await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
-        return
-
-    if text == "✏️ Group Reply":
-        current_reply = await db.get_setting("bot_group_reply_text", BOT_GROUP_REPLY_DEFAULT)
-        state[uid] = "await_bot_group_reply_text"
-        await update.message.reply_text(
-            f"Current group reply:\n\n{current_reply}\n\nSend the new reply text.",
-            reply_markup=BOT_ACCOUNT_MENU,
-            disable_web_page_preview=True,
-        )
         return
 
     if text == "🟢 Toggle Group Reply":

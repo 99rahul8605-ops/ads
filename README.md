@@ -94,7 +94,7 @@ Temporary `ConnectionError`, `OSError`, and asyncio timeout failures now retry o
 
 Open `🤖 Bot Accounts` in the control bot, then `➕ Add Bot` and send a BotFather token. The token is validated and encrypted with the existing `FERNET_KEY` before being stored in the operator's MongoDB scope.
 
-For each enabled bot account, the service listens for group/supergroup messages and replies directly to the user's original message. The cooldown key is **bot + group + user**, so the same user receives at most one reply per configured cooldown window in the same group (default 10 minutes). Another user in the group can receive a reply immediately, and the same user in a different group has a separate cooldown. Cooldowns are persisted in MongoDB.
+For each enabled bot account, the service listens for group/supergroup messages and replies directly to the user's original message using the same enabled promotion posts saved in **Posts**. The current Rotate/Random post mode is reused. The cooldown key is **bot + group + user**, so the same user receives at most one reply per configured cooldown window in the same group (default 10 minutes). Another user in the group can receive a reply immediately, and the same user in a different group has a separate cooldown. Cooldowns are persisted in MongoDB.
 
 A bot does not need to be a group administrator to send messages when the group permits normal member messaging. However, to receive every ordinary group message while not an administrator, disable that bot's Privacy Mode in BotFather (`/setprivacy`). The bot must be a member of the group and have permission to send messages. Bot messages are ignored.
 
