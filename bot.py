@@ -27,6 +27,8 @@ from telegram.ext import (
 from telethon import TelegramClient, errors, types, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 
 from database import Database, MongoSessionStore
 from pacing import AccountPacer
@@ -45,6 +47,7 @@ GROUP_DELAY_SECONDS = max(15, int(os.getenv("GROUP_DELAY_SECONDS", "30")))
 DM_BROADCAST_DELAY_SECONDS = max(30, int(os.getenv("DM_BROADCAST_DELAY_SECONDS", "60")))
 DM_REPLY_SEND_GAP_SECONDS = max(2, int(os.getenv("DM_REPLY_SEND_GAP_SECONDS", "5")))
 RESTRICTION_PAUSE_HOURS = max(24, int(os.getenv("RESTRICTION_PAUSE_HOURS", "24")))
+JOIN_QUEUE_INTERVAL_SECONDS = max(300, int(os.getenv("JOIN_QUEUE_INTERVAL_SECONDS", "300")))
 FERNET_KEY = os.environ["FERNET_KEY"].encode()
 fernet = Fernet(FERNET_KEY)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,7 +126,18 @@ PROMOTION_MENU = ReplyKeyboardMarkup(
 ACCOUNTS_MENU = ReplyKeyboardMarkup(
     [
         ["➕ Add Session", "👤 Sessions"],
-        ["🤖 Bot Accounts", "🗑 Remove Session"],
+        ["🔗 Join Groups", "🤖 Bot Accounts"],
+        ["🗑 Remove Session"],
+        ["⬅️ Back"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+JOIN_GROUPS_MENU = ReplyKeyboardMarkup(
+    [
+        ["➕ Add Group Links", "📋 Join Queue"],
+        ["🗑 Clear Pending Joins"],
         ["⬅️ Back"],
     ],
     resize_keyboard=True,
@@ -347,6 +361,7 @@ TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
 TENANT_STATS: dict[int, RuntimeStats] = {}
 PROMO_TASKS: dict[int, asyncio.Task] = {}
 LISTENER_TASKS: dict[int, asyncio.Task] = {}
+JOIN_QUEUE_TASKS: dict[int, asyncio.Task] = {}
 BOT_ACCOUNT_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 BOT_ACCOUNT_STATUS: dict[tuple[int, int], str] = {}
 OPERATORS_DIR = Path(os.getenv("OPERATORS_DIR", "operators"))
@@ -864,6 +879,133 @@ async def start_tenant_listener(app, uid: int):
                                                   name=f"account_dm_auto_reply_{uid}")
     finally:
         CURRENT_OPERATOR.reset(token)
+
+
+def normalize_join_link(raw: str):
+    """Return (original, normalized, kind, value) or None for unsupported links."""
+    value = (raw or "").strip().strip("<>")
+    if not value:
+        return None
+    if value.startswith("@"):  # public username
+        username = value[1:].strip()
+        if username and all(ch.isalnum() or ch == "_" for ch in username):
+            return value, f"public:{username.lower()}", "public", username
+        return None
+    low = value.lower()
+    for prefix in ("https://", "http://"):
+        if low.startswith(prefix):
+            value = value[len(prefix):]
+            low = value.lower()
+            break
+    if low.startswith("telegram.me/"):
+        value = value[len("telegram.me/"):]
+    elif low.startswith("t.me/"):
+        value = value[len("t.me/"):]
+    else:
+        return None
+    value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
+    if not value:
+        return None
+    if value.startswith("+"):
+        invite = value[1:]
+        return raw.strip(), f"invite:{invite}", "invite", invite if invite else None
+    if value.lower().startswith("joinchat/"):
+        invite = value.split("/", 1)[1]
+        return raw.strip(), f"invite:{invite}", "invite", invite if invite else None
+    # Message links (/c/...) and share links are not join targets.
+    if value.lower().startswith(("c/", "share/", "addlist/")):
+        return None
+    username = value.split("/", 1)[0]
+    if username and all(ch.isalnum() or ch == "_" for ch in username):
+        return raw.strip(), f"public:{username.lower()}", "public", username
+    return None
+
+
+async def _attempt_session_join(row: dict, link: str):
+    parsed = normalize_join_link(link)
+    if not parsed:
+        return "failed", "Unsupported or invalid Telegram group link"
+    _, _, kind, target = parsed
+    if not target:
+        return "failed", "Invalid invite link"
+    client = await get_account_client(row)
+    try:
+        if kind == "invite":
+            await client(ImportChatInviteRequest(target))
+        else:
+            await client(JoinChannelRequest(target))
+        return "joined", "Joined"
+    except errors.UserAlreadyParticipantError:
+        return "already", "Already joined"
+    except getattr(errors, "InviteRequestSentError", type(None)):
+        return "requested", "Join request sent"
+    except errors.FloodWaitError as exc:
+        await pause_account(str(row["id"]), max(1, int(exc.seconds)), f"Join queue FloodWait ({exc.seconds}s)")
+        return "retry", f"FloodWait {int(exc.seconds)}s"
+    except (getattr(errors, "PeerFloodError", type(None)), getattr(errors, "UserRestrictedError", type(None))) as exc:
+        await pause_account(str(row["id"]), RESTRICTION_PAUSE_HOURS * 3600, f"Join queue restriction ({type(exc).__name__})")
+        return "failed", type(exc).__name__
+    except (getattr(errors, "ChannelsTooMuchError", type(None)), getattr(errors, "InviteHashExpiredError", type(None)), getattr(errors, "InviteHashInvalidError", type(None)), getattr(errors, "ChannelPrivateError", type(None))) as exc:
+        return "failed", type(exc).__name__
+    except errors.RPCError as exc:
+        name = type(exc).__name__
+        # Some Telegram layers return an updates object for request-to-join; newer
+        # Telethon exposes InviteRequestSentError. Keep unknown RPC failures visible.
+        return "failed", name
+    except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
+        return "retry", type(exc).__name__
+
+
+async def join_queue_service(app: Application, owner_uid: int):
+    """Persisted, per-account join queue. Each account attempts at most one item per 5 min."""
+    token_ctx = CURRENT_OPERATOR.set(owner_uid)
+    try:
+        while owner_uid in APPROVED_USERS:
+            try:
+                enabled = (await db.get_setting("join_queue_enabled", "true")).lower() in {"true", "1", "yes", "on"}
+                if not enabled:
+                    await asyncio.sleep(10)
+                    continue
+                rows = await session_store.get_sessions(enabled_only=True)
+                now = time.time()
+                for row in rows:
+                    sid = str(row["id"])
+                    try:
+                        last = float(await db.get_setting(f"join_queue_last_attempt:{sid}", "0") or 0)
+                    except (TypeError, ValueError):
+                        last = 0.0
+                    if now - last < JOIN_QUEUE_INTERVAL_SECONDS:
+                        continue
+                    item = await db.next_pending_join(sid)
+                    if not item:
+                        continue
+                    # Persist the pacing timestamp before attempting so restart cannot
+                    # cause a burst of back-to-back joins.
+                    await db.set_setting(f"join_queue_last_attempt:{sid}", str(time.time()))
+                    status, detail = await _attempt_session_join(row, item.get("link", ""))
+                    if status == "retry":
+                        await db.retry_join_item(item["id"], detail)
+                    else:
+                        await db.finish_join_item(item["id"], status, detail)
+                    log.info("join-queue owner=%s account=%s status=%s link=%s detail=%s", owner_uid, row.get("label"), status, item.get("normalized_link"), detail)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Join queue service error owner=%s", owner_uid)
+            await asyncio.sleep(5)
+    finally:
+        JOIN_QUEUE_TASKS.pop(owner_uid, None)
+        CURRENT_OPERATOR.reset(token_ctx)
+
+
+async def start_join_queue_service(app: Application, owner_uid: int):
+    task = JOIN_QUEUE_TASKS.get(owner_uid)
+    if task and not task.done():
+        return
+    JOIN_QUEUE_TASKS[owner_uid] = asyncio.create_task(
+        join_queue_service(app, owner_uid), name=f"join_queue_{owner_uid}"
+    )
+
 
 def authorized_handler(handler):
     @wraps(handler)
@@ -2151,6 +2293,7 @@ async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"_id": uid}, {"$set": {"approved_by": ADMIN_ID, "approved_at": time.time()}}, upsert=True))
         APPROVED_USERS.add(uid)
         await start_tenant_listener(context.application, uid)
+        await start_join_queue_service(context.application, uid)
         await sync_bot_account_listeners(context.application, uid)
         await update.message.reply_text(f"✅ Added {uid}. Their sessions, bot accounts, posts, media and jobs are separate.\n\nThey can now open /start.")
         try:
@@ -2175,7 +2318,7 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(operator_access.delete_one, {"_id": uid})
     st = tenant_stats(uid)
     st.running = False
-    tasks = [PROMO_TASKS.pop(uid, None), LISTENER_TASKS.pop(uid, None)]
+    tasks = [PROMO_TASKS.pop(uid, None), LISTENER_TASKS.pop(uid, None), JOIN_QUEUE_TASKS.pop(uid, None)]
     tasks.extend([task for (owner_uid, _), task in list(BOT_ACCOUNT_TASKS.items()) if owner_uid == uid])
     for key in [key for key in list(BOT_ACCOUNT_TASKS) if key[0] == uid]:
         BOT_ACCOUNT_TASKS.pop(key, None)
@@ -2730,6 +2873,49 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
 
+    if current == "await_join_links":
+        raw_lines = [line.strip() for line in text.replace(",", "\n").splitlines() if line.strip()]
+        parsed = []
+        invalid = []
+        seen = set()
+        for raw in raw_lines:
+            item = normalize_join_link(raw)
+            if not item:
+                invalid.append(raw)
+                continue
+            original, normalized, _kind, _value = item
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            parsed.append((original, normalized))
+        if not parsed:
+            await update.message.reply_text(
+                "❌ No valid Telegram group links found.\n\nSend one link per line, for example:\nhttps://t.me/publicgroup\nhttps://t.me/+PrivateInviteHash",
+                reply_markup=JOIN_GROUPS_MENU,
+            )
+            return
+        rows = await session_store.get_sessions(enabled_only=True)
+        if not rows:
+            await update.message.reply_text("❌ No active real-user sessions are connected.", reply_markup=ACCOUNTS_MENU)
+            state.pop(uid, None)
+            return
+        added, existing = await db.enqueue_join_links(rows, parsed)
+        state.pop(uid, None)
+        await start_join_queue_service(context.application, uid)
+        lines = [
+            "✅ <b>JOIN QUEUE UPDATED</b>",
+            f"Links accepted: <b>{len(parsed)}</b>",
+            f"Active accounts: <b>{len(rows)}</b>",
+            f"New account/link jobs: <b>{added}</b>",
+            f"Already queued/history: <b>{existing}</b>",
+            "",
+            f"Each connected ID attempts at most <b>1 group every {JOIN_QUEUE_INTERVAL_SECONDS // 60} minutes</b>.",
+        ]
+        if invalid:
+            lines.append(f"⚠️ Invalid/unsupported lines skipped: <b>{len(invalid)}</b>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=JOIN_GROUPS_MENU)
+        return
+
     if current == "await_bot_token":
         token_raw = text.strip()
         await safe_delete_message(update.message)
@@ -2970,6 +3156,64 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{int(r['bot_id'])} — @{r.get('username') or 'no_username'}" for r in rows
         ]
         await update.message.reply_text("\n".join(lines), reply_markup=BOT_ACCOUNT_MENU)
+        return
+
+    if text == "🔗 Join Groups":
+        state.pop(uid, None)
+        st = await db.join_queue_stats()
+        await update.message.reply_text(
+            "🔗 <b>JOIN GROUPS</b>\n\n"
+            f"Pending: <b>{st['pending']}</b> • Joined: <b>{st['joined']}</b>\n"
+            f"Requests sent: <b>{st['requested']}</b> • Already joined: <b>{st['already']}</b>\n"
+            f"Failed: <b>{st['failed']}</b>\n\n"
+            f"Each connected real-user ID processes at most one queued link every {JOIN_QUEUE_INTERVAL_SECONDS // 60} minutes.",
+            parse_mode=ParseMode.HTML, reply_markup=JOIN_GROUPS_MENU,
+        )
+        return
+
+    if text == "➕ Add Group Links":
+        rows = await session_store.get_sessions(enabled_only=True)
+        if not rows:
+            await update.message.reply_text("❌ Add/activate a real-user session first.", reply_markup=ACCOUNTS_MENU)
+            return
+        state[uid] = "await_join_links"
+        await update.message.reply_text(
+            "Send Telegram group/channel links now. One per line.\n\n"
+            "Examples:\n"
+            "<code>https://t.me/publicgroup</code>\n"
+            "<code>@publicgroup</code>\n"
+            "<code>https://t.me/+AbCdEf123456</code>\n\n"
+            "The same list will be queued for every currently active connected real-user ID.",
+            parse_mode=ParseMode.HTML, reply_markup=JOIN_GROUPS_MENU,
+        )
+        return
+
+    if text == "📋 Join Queue":
+        st = await db.join_queue_stats()
+        recent = await db.list_recent_join_items(20)
+        lines = [
+            "📋 <b>JOIN QUEUE</b>",
+            f"Pending <b>{st['pending']}</b> • Joined <b>{st['joined']}</b> • Requested <b>{st['requested']}</b>",
+            f"Already <b>{st['already']}</b> • Failed <b>{st['failed']}</b>",
+        ]
+        if recent:
+            lines.append("\n<b>Recent:</b>")
+            icons = {"pending":"⏳", "joined":"✅", "requested":"📝", "already":"☑️", "failed":"❌"}
+            for item in recent[:15]:
+                label = item.get("label") or str(item.get("tg_user_id") or "Account")
+                status = item.get("status", "pending")
+                link = item.get("link", "")
+                detail = item.get("detail", "")
+                lines.append(f"{icons.get(status,'•')} {esc(label)} • {esc(link)[:70]}" + (f" • {esc(detail)[:60]}" if detail else ""))
+        await update.message.reply_text("\n".join(lines)[:3900], parse_mode=ParseMode.HTML, reply_markup=JOIN_GROUPS_MENU)
+        return
+
+    if text == "🗑 Clear Pending Joins":
+        result = await db.clear_pending_join_items()
+        await update.message.reply_text(
+            f"✅ Cleared <b>{int(result.deleted_count)}</b> pending join job(s). Completed history was kept.",
+            parse_mode=ParseMode.HTML, reply_markup=JOIN_GROUPS_MENU,
+        )
         return
 
     if text == "➕ Add Session":
@@ -3320,13 +3564,14 @@ async def post_init(app: Application):
     for uid in sorted(APPROVED_USERS):
         await initialize_tenant(uid)
         await start_tenant_listener(app, uid)
+        await start_join_queue_service(app, uid)
         await sync_bot_account_listeners(app, uid)
 
 
 async def post_shutdown(app: Application):
     for st in TENANT_STATS.values():
         st.running = False
-    jobs = list(PROMO_TASKS.values()) + list(LISTENER_TASKS.values()) + list(BOT_ACCOUNT_TASKS.values())
+    jobs = list(PROMO_TASKS.values()) + list(LISTENER_TASKS.values()) + list(JOIN_QUEUE_TASKS.values()) + list(BOT_ACCOUNT_TASKS.values())
     jobs += [value for key, value in app.bot_data.items() if key.startswith("dm_broadcast_task:") and value]
     for task in jobs:
         if task and not task.done():
@@ -3334,6 +3579,7 @@ async def post_shutdown(app: Application):
     await asyncio.gather(*(task for task in jobs if task), return_exceptions=True)
     PROMO_TASKS.clear()
     LISTENER_TASKS.clear()
+    JOIN_QUEUE_TASKS.clear()
     BOT_ACCOUNT_TASKS.clear()
     await asyncio.gather(*(close_account_client(sid) for sid in list(_account_dm_clients)),
                          return_exceptions=True)

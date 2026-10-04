@@ -26,6 +26,7 @@ class Database:
         self.bot_reply_cooldowns = mongo_db["bot_reply_cooldowns"]
         self.bot_account_groups = mongo_db["bot_account_groups"]
         self.bot_account_events = mongo_db["bot_account_events"]
+        self.join_queue = mongo_db["account_join_queue"]
 
     async def init(self):
         def _init():
@@ -40,6 +41,8 @@ class Database:
             self.bot_account_groups.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("chat_id", ASCENDING)], unique=True)
             self.bot_account_groups.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("active", ASCENDING)])
             self.bot_account_events.create_index([("owner_id", ASCENDING), ("bot_id", ASCENDING), ("created_at", ASCENDING)])
+            self.join_queue.create_index([("owner_id", ASCENDING), ("session_id", ASCENDING), ("normalized_link", ASCENDING)], unique=True)
+            self.join_queue.create_index([("owner_id", ASCENDING), ("session_id", ASCENDING), ("status", ASCENDING), ("created_at", ASCENDING)])
             # Keep the post counter at least as high as the largest existing id.
             last = self.posts.find_one({"owner_id": self.owner_id}, sort=[("id", -1)], projection={"id": 1})
             max_id = int(last.get("id", 0)) if last else 0
@@ -328,6 +331,101 @@ class Database:
                 "chat_id": int(chat_id),
                 "user_id": int(user_id),
             },
+        )
+
+
+    async def enqueue_join_links(self, session_rows, links):
+        """Queue the same normalized link list for every currently active session."""
+        now = datetime.now(timezone.utc)
+        def _add():
+            added = 0
+            existing = 0
+            for row in session_rows:
+                sid = str(row["id"])
+                for link, normalized in links:
+                    result = self.join_queue.update_one(
+                        {"owner_id": self.owner_id, "session_id": sid, "normalized_link": normalized},
+                        {"$setOnInsert": {
+                            "owner_id": self.owner_id,
+                            "session_id": sid,
+                            "tg_user_id": row.get("tg_user_id"),
+                            "label": row.get("first_name") or row.get("label") or str(row.get("tg_user_id") or sid),
+                            "link": link,
+                            "normalized_link": normalized,
+                            "status": "pending",
+                            "attempts": 0,
+                            "created_at": now,
+                            "updated_at": now,
+                        }},
+                        upsert=True,
+                    )
+                    if result.upserted_id is not None:
+                        added += 1
+                    else:
+                        existing += 1
+            return added, existing
+        return await asyncio.to_thread(_add)
+
+    async def next_pending_join(self, session_id: str):
+        def _get():
+            doc = self.join_queue.find_one(
+                {"owner_id": self.owner_id, "session_id": str(session_id), "status": "pending"},
+                sort=[("created_at", ASCENDING)],
+            )
+            if not doc:
+                return None
+            doc["id"] = str(doc.pop("_id"))
+            return doc
+        return await asyncio.to_thread(_get)
+
+    async def finish_join_item(self, item_id: str, status: str, detail: str = ""):
+        from bson import ObjectId
+        now = datetime.now(timezone.utc)
+        def _finish():
+            return self.join_queue.update_one(
+                {"_id": ObjectId(str(item_id)), "owner_id": self.owner_id},
+                {"$set": {"status": str(status), "detail": str(detail)[:500], "updated_at": now},
+                 "$inc": {"attempts": 1}},
+            ).modified_count
+        return await asyncio.to_thread(_finish)
+
+    async def retry_join_item(self, item_id: str, detail: str = ""):
+        from bson import ObjectId
+        now = datetime.now(timezone.utc)
+        def _retry():
+            return self.join_queue.update_one(
+                {"_id": ObjectId(str(item_id)), "owner_id": self.owner_id},
+                {"$set": {"status": "pending", "detail": str(detail)[:500], "updated_at": now},
+                 "$inc": {"attempts": 1}},
+            ).modified_count
+        return await asyncio.to_thread(_retry)
+
+    async def join_queue_stats(self):
+        def _stats():
+            out = {"pending": 0, "joined": 0, "requested": 0, "already": 0, "failed": 0}
+            pipeline = [
+                {"$match": {"owner_id": self.owner_id}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+            for row in self.join_queue.aggregate(pipeline):
+                key = str(row.get("_id") or "")
+                if key in out:
+                    out[key] = int(row.get("count", 0))
+            return out
+        return await asyncio.to_thread(_stats)
+
+    async def list_recent_join_items(self, limit: int = 30):
+        def _list():
+            docs = list(self.join_queue.find(
+                {"owner_id": self.owner_id}, {"_id": 0}
+            ).sort("updated_at", -1).limit(max(1, int(limit))))
+            return docs
+        return await asyncio.to_thread(_list)
+
+    async def clear_pending_join_items(self):
+        return await asyncio.to_thread(
+            self.join_queue.delete_many,
+            {"owner_id": self.owner_id, "status": "pending"},
         )
 
 

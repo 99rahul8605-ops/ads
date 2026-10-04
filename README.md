@@ -109,3 +109,6 @@ The control bot token cannot be added as a Bot Account. If the same added bot to
 - Bot bio updates Telegram bot short description (About text).
 - User bio updates the connected Telegram user's profile About field.
 - Send CLEAR in the bio prompt to remove the bio.
+
+## Join Groups queue
+Use **Accounts → Join Groups → Add Group Links** and send one Telegram link per line. Public `https://t.me/name`, `@name`, private `https://t.me/+hash`, and `https://t.me/joinchat/hash` links are accepted. The same list is queued for each currently active real-user session. Each account attempts at most one queued join/request every 5 minutes; Telegram FloodWait/restrictions are obeyed and one account does not stop the others.
