@@ -1,4 +1,5 @@
 import asyncio
+asyncio.set_event_loop(asyncio.new_event_loop())
 import html
 import logging
 import os
@@ -35,6 +36,7 @@ from pacing import AccountPacer
 from app import start_server
 
 load_dotenv()
+
 Thread(target=start_server, daemon=True).start()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
