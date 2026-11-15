@@ -188,6 +188,12 @@ POST_MENU = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
+POST_SAVE_MENU = ReplyKeyboardMarkup(
+    [["✅ Done Saving", "⬅️ Back"]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
 POST_MODE_MENU = ReplyKeyboardMarkup(
     [["🔄 Rotate", "🎲 Random"], ["⬅️ Back"]],
     resize_keyboard=True,
@@ -196,8 +202,9 @@ POST_MODE_MENU = ReplyKeyboardMarkup(
 
 AUTO_REPLY_MENU = ReplyKeyboardMarkup(
     [
-        ["✏️ Account Reply", "✏️ Control Bot Reply"],
-        ["👁 Reply Preview", "🔄 Use Saved Post"],
+        ["✏️ Account Reply", "🎯 Per-ID Reply"],
+        ["✏️ Control Bot Reply", "👁 Reply Preview"],
+        ["🔄 Use Saved Post"],
         ["🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"],
         ["⏱ Reply Cooldown", "📡 Reply Status"],
         ["⬅️ Back"],
@@ -273,6 +280,38 @@ async def reply_cooldown() -> int:
 def _client_key_from_row(row: dict) -> str:
     tg_id = row.get("tg_user_id")
     return str(tg_id if tg_id is not None else row["id"])
+
+
+# Per-connected-real-ID reply overrides. Settings are scoped by the existing
+# tenant DB proxy, keyed by the Telegram ID (not a replaceable Mongo row ID).
+def account_reply_override_key(session_key: str) -> str:
+    return f"account_dm_override:{session_key}"
+
+
+async def account_reply_override(session_key: str) -> str | None:
+    value = await db.get_setting(account_reply_override_key(session_key), None)
+    return value if value else None
+
+
+async def show_per_id_reply_picker(message):
+    rows = await session_store.get_sessions()
+    if not rows:
+        await message.reply_text("❌ Add a real Telegram account first.", reply_markup=AUTO_REPLY_MENU)
+        return
+    buttons = []
+    for row in rows:
+        sid = str(row["id"])
+        label = str(row.get("first_name") or row.get("label") or row.get("username") or row.get("tg_user_id") or sid)
+        override = await account_reply_override(str(row["id"]))
+        buttons.append([InlineKeyboardButton(
+            f"{'📝 Custom' if override else '🌐 Default'} · {label[:28]}",
+            callback_data=f"reply_id:{sid}",
+        )])
+    await message.reply_text(
+        "🎯 <b>PER-ID AUTO REPLY</b>\n\nSelect an account. "
+        "Default is shared across all IDs; only IDs with a custom message use a different reply.",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def reply_panel_text() -> str:
@@ -382,6 +421,54 @@ operator_access = _access_mongo[MONGO_DB]["approved_operators"]
 ACCOUNT_METRICS: dict[tuple[int, str, str], dict] = {}
 ACCOUNT_EVENTS: dict[tuple[int, str, str], deque] = {}
 ACCOUNT_PROGRESS_MESSAGES: dict[tuple[int, str, str], object] = {}
+# One main promotion stats message per operator, reused across scheduled rounds.
+PROMO_PROGRESS_MESSAGES: dict[int, object] = {}
+PROMO_PROGRESS_LAST_EDIT: dict[int, float] = {}
+
+
+async def edit_promo_progress(message, *, force=False):
+    if message is None:
+        return
+    owner = tenant_id()
+    now = time.monotonic()
+    if not force and now - PROMO_PROGRESS_LAST_EDIT.get(owner, 0) < 12:
+        return
+    PROMO_PROGRESS_LAST_EDIT[owner] = now
+    try:
+        await message.edit_text(stats_text(), parse_mode=ParseMode.HTML)
+    except BadRequest as exc:
+        if 'not modified' not in str(exc).lower():
+            log.warning('Promotion progress edit failed: %s', exc)
+    except Exception as exc:
+        log.warning('Promotion progress edit failed: %s', type(exc).__name__)
+
+
+async def get_promo_progress_message(app):
+    owner = tenant_id()
+    message = PROMO_PROGRESS_MESSAGES.get(owner)
+    if message is not None:
+        await edit_promo_progress(message, force=True)
+        return message
+    message = await app.bot.send_message(owner, stats_text(), parse_mode=ParseMode.HTML)
+    PROMO_PROGRESS_MESSAGES[owner] = message
+    try:
+        await app.bot.pin_chat_message(chat_id=owner, message_id=message.message_id,
+                                       disable_notification=True)
+    except TelegramError as exc:
+        log.warning('Could not pin promotion stats for operator %s: %s', owner, exc)
+    return message
+
+
+async def get_account_promo_message(app, row, metric):
+    key = metric_key(row['id'], 'promo')
+    message = ACCOUNT_PROGRESS_MESSAGES.get(key)
+    if message is not None:
+        await edit_account_progress(row, metric, force=True)
+        return message
+    message = await app.bot.send_message(tenant_id(), account_stats_text(metric),
+                                         parse_mode=ParseMode.HTML)
+    ACCOUNT_PROGRESS_MESSAGES[key] = message
+    return message
 
 
 def metric_key(session_id, kind):
@@ -1510,6 +1597,10 @@ async def wait_for_flood_release(row, metric):
     metric["status"] = "Paused (FloodWait)"
     await log_account_state(row, metric, "PAUSED", "Waiting for Telegram cooldown")
     while stats.running:
+        if metric.get("kind") == "promo" and promo_account_disabled(sid):
+            metric["status"] = "Stopped manually"
+            await edit_account_progress(row, metric, force=True)
+            return False
         remaining = await get_pause_remaining(sid)
         if remaining <= 0:
             metric["status"] = "Running"
@@ -1616,6 +1707,11 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
         for target_index, (target_type, entity, name) in enumerate(targets):
             if not stats.running:
                 return
+            if promo_account_disabled(sid):
+                metric["status"] = "Stopped manually"
+                metric["target"] = "Disabled in Sessions"
+                await log_account_state(row, metric, "STOPPED", "Manual promotion OFF")
+                return
             stats.current_session = row["label"]
             stats.current_group = f"{'👥' if target_type == 'group' else '👤'} {name}"
             target_key = (sid, str(entity))
@@ -1632,7 +1728,7 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                 # A single pacing lock is shared with this account's incoming DM auto-reply.
                 await pacer.run(
                     sid, delay if target_type == "group" else DM_BROADCAST_DELAY_SECONDS,
-                    lambda: guarded_account_send(
+                    lambda: checked_promo_send(
                         sid,
                         lambda: run_with_connection_retry(
                             row,
@@ -1650,6 +1746,15 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                     stats.group_sent += 1
                 else:
                     stats.user_sent += 1
+            except AccountPromotionDisabled:
+                outcome, error = "skipped", "Stopped manually"
+                stats.skipped += 1
+                if target_type == "group":
+                    stats.group_skipped += 1
+                else:
+                    stats.user_skipped += 1
+                metric["status"] = "Stopped manually"
+                stop_this_account = True
             except AccountPausedError as e:
                 outcome, error = "skipped", f"Account paused {e.remaining}s"
                 stats.skipped += 1
@@ -1727,6 +1832,8 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                     stats.user_attempted += 1
 
             await edit_account_progress(row, metric, force=stop_this_account or resume_after_flood)
+            async with edit_lock:
+                await edit_promo_progress(progress_msg)
             if stop_this_account:
                 break
             if resume_after_flood:
@@ -1735,7 +1842,8 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
             # No explicit sleep here: AccountPacer enforces the minimum gap
             # between completed sends, including interleaved DM auto-replies.
     finally:
-        metric["status"] = "Stopped" if not stats.running else "Finished"
+        metric["status"] = ("Stopped manually" if promo_account_disabled(sid) else
+                            "Stopped" if not stats.running else "Finished")
         metric["target"] = "-"
         try:
             await edit_account_progress(row, metric, force=True)
@@ -1743,6 +1851,26 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
             raise
         except Exception as exc:
             log.warning("Final account progress update failed for %s: %s", row.get("label", sid), type(exc).__name__)
+
+
+# Per-operator, per-session in-memory gate for immediately halting only promotion.
+# Database session.promo_enabled persists this choice over process restarts.
+PROMO_DISABLED_ACCOUNTS: set[tuple[int, str]] = set()
+
+
+def promo_account_disabled(session_id: str) -> bool:
+    return (tenant_id(), str(session_id)) in PROMO_DISABLED_ACCOUNTS
+
+
+class AccountPromotionDisabled(Exception):
+    """Stop this account's group-promotion worker without stopping other IDs."""
+
+
+async def checked_promo_send(session_id: str, operation):
+    # Called from inside the AccountPacer after its queue/delay, before sending.
+    if promo_account_disabled(session_id):
+        raise AccountPromotionDisabled()
+    return await guarded_account_send(session_id, operation)
 
 
 async def do_round(app: Application):
@@ -1755,6 +1883,15 @@ async def do_round(app: Application):
         raise RuntimeError("No active sessions")
     if not posts:
         raise RuntimeError("No enabled promotion posts")
+
+    # Reload DB state each round, so the operator's toggles survive restart.
+    for row in sessions:
+        key = (tenant_id(), str(row["id"]))
+        if row.get("promo_enabled", True):
+            PROMO_DISABLED_ACCOUNTS.discard(key)
+        else:
+            PROMO_DISABLED_ACCOUNTS.add(key)
+    sessions = [row for row in sessions if not promo_account_disabled(str(row["id"]))]
 
     stats.post_mode = mode
     stats.active_posts = len(posts)
@@ -1775,6 +1912,8 @@ async def do_round(app: Application):
     async def prepare(row):
         client = None
         try:
+            if promo_account_disabled(str(row["id"])):
+                return row, None, [], [], ("disabled", 0)
             remaining = await get_pause_remaining(str(row["id"]))
             if remaining:
                 return row, None, [], [], ("paused", remaining)
@@ -1790,6 +1929,10 @@ async def do_round(app: Application):
 
     results = await asyncio.gather(*(prepare(row) for row in sessions))
     for row, client, groups, users, err in results:
+        if isinstance(err, tuple) and err[0] == "disabled":
+            continue
+        if promo_account_disabled(str(row["id"])):
+            continue
         if isinstance(err, tuple) and err[0] == "paused":
             stats.paused_sessions += 1
             stats.last_error = f"{row['label']}: account cooling down ({fmt_duration(err[1])} left)"
@@ -1809,9 +1952,9 @@ async def do_round(app: Application):
 
     progress_msg = None
     try:
-        progress_msg = await app.bot.send_message(tenant_id(), stats_text(), parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+        progress_msg = await get_promo_progress_message(app)
+    except Exception as exc:
+        log.warning('Could not initialize promotion progress: %s', type(exc).__name__)
 
     edit_lock = asyncio.Lock()
     metrics = {}
@@ -1819,21 +1962,21 @@ async def do_round(app: Application):
         metric = begin_metric(row, 'promo', len(groups)+len(users), len(groups), len(users))
         metrics[str(row['id'])] = metric
         try:
-            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
-            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
+            await get_account_promo_message(app, row, metric)
         except Exception:
             pass
     async def resume_prepaused(row):
         """Reconnect only this account when a pre-existing FloodWait expires."""
         sid = str(row["id"])
+        if promo_account_disabled(sid):
+            return
         metric = begin_metric(row, 'promo')
         metrics[sid] = metric
         try:
-            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
-            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
+            await get_account_promo_message(app, row, metric)
         except Exception:
             pass
-        if not await wait_for_flood_release(row, metric):
+        if not await wait_for_flood_release(row, metric) or promo_account_disabled(sid):
             return
         try:
             # An independent account may encounter a new Telegram cooldown
@@ -1914,7 +2057,7 @@ async def do_round(app: Application):
 
     if progress_msg:
         try:
-            await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
+            await edit_promo_progress(progress_msg, force=True)
         except Exception:
             pass
 
@@ -2171,7 +2314,9 @@ def account_reply_handler(session_key: str):
             return
         _account_reply_pending.add(key)
         try:
-            if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
+            # Per-ID text wins over the shared default, including saved-post mode.
+            custom_message = await account_reply_override(session_key)
+            if not custom_message and await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
                 mode = await db.get_setting("post_mode", "rotate")
                 post = await db.next_reply_post(mode)
                 if post:
@@ -2183,7 +2328,7 @@ def account_reply_handler(session_key: str):
                     _account_reply_timestamps[key] = time.monotonic()
                     _reply_sent_counts["accounts"] += 1
                     return
-            message = await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
+            message = custom_message or await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
             await pacer.run(
                 session_key, DM_REPLY_SEND_GAP_SECONDS,
                 lambda: guarded_account_send(session_key, lambda: event.reply(message, link_preview=False)),
@@ -2406,6 +2551,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("bio_kind", None)
         context.user_data.pop("bio_mode", None)
         context.user_data.pop("bio_target", None)
+        context.user_data.pop("reply_target_key", None)
         await cleanup_login_flow(uid)
         await update.message.reply_text("Main menu.", reply_markup=MENU)
         return
@@ -2574,6 +2720,31 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Auto-reply saved. New incoming DMs will use it.\n\n" + await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
         return
 
+    if current == "await_per_id_reply":
+        target = context.user_data.get("reply_target_key")
+        if not target:
+            state.pop(uid, None)
+            await update.message.reply_text("❌ Account selection expired. Open 🎯 Per-ID Reply again.", reply_markup=AUTO_REPLY_MENU)
+            return
+        if text.casefold() in {"cancel", "/cancel", "❌ cancel"}:
+            state.pop(uid, None)
+            context.user_data.pop("reply_target_key", None)
+            await update.message.reply_text("Cancelled.", reply_markup=AUTO_REPLY_MENU)
+            return
+        if not text.strip() or len(text) > 4000:
+            await update.message.reply_text("Send reply text (1–4000 characters), or CLEAR to use the default.", reply_markup=AUTO_REPLY_MENU)
+            return
+        if text.strip().upper() == "CLEAR":
+            await db.set_setting(account_reply_override_key(target), "")
+            response = "✅ Custom reply removed. This ID now uses the shared default."
+        else:
+            await db.set_setting(account_reply_override_key(target), text)
+            response = "✅ Custom reply saved for this ID only. Other IDs are unchanged."
+        state.pop(uid, None)
+        context.user_data.pop("reply_target_key", None)
+        await update.message.reply_text(response, reply_markup=AUTO_REPLY_MENU)
+        return
+
     if current == "await_reply_cooldown":
         try:
             minutes = int(text)
@@ -2590,6 +2761,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "💬 Auto Reply":
         state.pop(uid, None)
         await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+        return
+    if text == "🎯 Per-ID Reply":
+        state.pop(uid, None)
+        await show_per_id_reply_picker(update.message)
         return
     if text == "✏️ Account Reply":
         state[uid] = "await_account_reply"
@@ -3251,12 +3426,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name = r['first_name'] or r['label'] or str(r.get('tg_user_id') or sid)
             lines.append(
                 f"#{sid} • {esc(display_name)} • {esc(uname)}\n"
-                f"{status} • groups: {gcount} • users: {ucount}"
+                f"{status} • Promo: {'🟢 ON' if r.get('promo_enabled', True) else '🔴 OFF'}"
+                f" • groups: {gcount} • users: {ucount}"
             )
-            buttons.append([InlineKeyboardButton(
-                f"🗑 Remove {str(display_name)[:24]}",
-                callback_data=f"sess_rm:{sid}",
-            )])
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{'⏸ Stop Promo' if r.get('promo_enabled', True) else '▶️ Resume Promo'} · {str(display_name)[:18]}",
+                    callback_data=f"sess_promo:{sid}",
+                ),
+                InlineKeyboardButton("🗑 Remove", callback_data=f"sess_rm:{sid}"),
+            ])
         await update.message.reply_text(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
@@ -3275,8 +3454,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📝 Save Post":
         state[uid] = "await_post"
         await update.message.reply_text(
-            "Send another promotion post now. Existing posts will not be replaced.\n\nSupported: text, photo, video, document, animation. Use Back to cancel.",
-            reply_markup=POST_MENU,
+            "📥 <b>Continuous Post Saving ON</b>\n\n"
+            "Send as many posts as you want, one after another. Each will be saved automatically.\n"
+            "Supports: text, photo, video, document, animation.\n\n"
+            "Press ✅ Done Saving when finished. Existing posts are retained.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=POST_SAVE_MENU,
         )
 
     elif text == "⏳ Group Delay":
@@ -3359,6 +3542,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("❌ Add at least one session first.", reply_markup=MENU)
             return
+        # A new manual start gets a fresh pinned status; scheduled rounds reuse it.
+        PROMO_PROGRESS_MESSAGES.pop(uid, None)
+        PROMO_PROGRESS_LAST_EDIT.pop(uid, None)
+        for key in list(ACCOUNT_PROGRESS_MESSAGES):
+            if key[0] == uid and key[2] == 'promo':
+                ACCOUNT_PROGRESS_MESSAGES.pop(key, None)
+        stats.round_no = 0
         stats.running = True
         PROMO_TASKS[uid] = asyncio.create_task(scheduler(context.application), name=f"promo_scheduler_{uid}")
         await update.message.reply_text("▶️ Promotion started. Accounts run concurrently. Each account gets its own progress message; use 📊 Account Stats and 📜 Account Logs.", reply_markup=MENU)
@@ -3414,8 +3604,28 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get(uid) != "await_post":
         return
     m = update.message
-    if m.text in {"⬅️ Back", "❌ Cancel"}:
+    if m.text in {"✅ Done Saving", "⬅️ Back", "❌ Cancel"}:
         state.pop(uid, None)
+        if m.text == "✅ Done Saving":
+            # Do not let the generic menu handler process this same text.
+            context.user_data["post_saved_message_id"] = m.message_id
+            await m.reply_text("✅ Finished saving posts. You can manage them from 📝 Posts.", reply_markup=POST_MENU)
+        return
+
+    # Prevent a navigation-button label from accidentally becoming a saved post.
+    # Exit save mode first, then use the other post-management buttons.
+    reserved_buttons = {
+        "📝 Save Post", "📋 List Posts", "👁 Preview Post", "🔘 Toggle Post",
+        "🗑 Delete Post", "🔀 Sending Mode", "📝 Posts", "📣 Promotion",
+        "👥 Accounts", "💬 Auto Reply", "✏️ Edit/Set Bio", "📊 Monitoring",
+        "🔄 Rotate", "🎲 Random",
+    }
+    if m.text in reserved_buttons:
+        context.user_data["post_saved_message_id"] = m.message_id
+        await m.reply_text(
+            "📥 Still in continuous save mode. Send a post, or tap ✅ Done Saving to manage other options.",
+            reply_markup=POST_SAVE_MENU,
+        )
         return
 
     html_text = m.text_html or m.caption_html or ""
@@ -3451,11 +3661,17 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         post_id = await db.add_post(kind, html_text, media_path, media_type)
-        state.pop(uid, None)
+        # Keep awaiting additional posts until Done Saving / Back is selected.
         context.user_data["post_saved_message_id"] = m.message_id
-        await m.reply_text(f"✅ Post #{post_id} added. All existing posts are retained.\n\nSelect 🔀 Sending Mode to choose Rotate or Random.", reply_markup=POST_MENU)
+        await m.reply_text(
+            f"✅ Post #{post_id} saved. Send the next post, or press ✅ Done Saving.",
+            reply_markup=POST_SAVE_MENU,
+        )
     except Exception as e:
-        await m.reply_text(f"❌ Could not save post:\n{type(e).__name__}: {e}", reply_markup=MENU)
+        await m.reply_text(
+            f"❌ Could not save post:\n{type(e).__name__}: {e}\n\nYou can retry or press ✅ Done Saving.",
+            reply_markup=POST_SAVE_MENU,
+        )
 
 
 async def bio_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3507,6 +3723,70 @@ async def bio_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✏️ Selected: <b>{esc(label)}</b>\n\nSend the new bio now.\nSend <code>CLEAR</code> to remove the bio.",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def per_id_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    sid = (q.data or "").split(":", 1)[1]
+    rows = await session_store.get_sessions()
+    row = next((r for r in rows if str(r["id"]) == sid), None)
+    if row is None:
+        await q.answer("Account not found. Reopen Per-ID Reply.", show_alert=True)
+        return
+    await q.answer()
+    target = str(row["id"])
+    context.user_data["reply_target_key"] = target
+    state[update.effective_user.id] = "await_per_id_reply"
+    label = str(row.get("first_name") or row.get("label") or row.get("username") or target)
+    existing = await account_reply_override(target)
+    preview = ("\nCurrent custom reply: <pre>" + esc(existing[:1000]) + "</pre>") if existing else "\nCurrently using the shared default."
+    await q.message.reply_text(
+        f"🎯 <b>{esc(label)}</b> · <code>{esc(target)}</code>" + preview +
+        "\n\nSend a new reply message for this ID.\nSend <code>CLEAR</code> to restore shared default, or <code>cancel</code> to exit.",
+        parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU,
+    )
+
+
+async def session_promo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    sid = (q.data or "").split(":", 1)[1]
+    rows = await session_store.get_sessions()
+    row = next((r for r in rows if str(r["id"]) == sid), None)
+    if row is None:
+        await q.answer("Session not found. Refresh Sessions.", show_alert=True)
+        return
+    enabled = not row.get("promo_enabled", True)
+    if enabled and (not row.get("enabled", True) or row.get("auth_state") == "needs_relogin"):
+        await q.answer("Account must be active and logged in first.", show_alert=True)
+        return
+    if not await session_store.set_promo_enabled(sid, enabled):
+        await q.answer("Could not update session.", show_alert=True)
+        return
+    key = (tenant_id(), sid)
+    if enabled:
+        PROMO_DISABLED_ACCOUNTS.discard(key)
+    else:
+        PROMO_DISABLED_ACCOUNTS.add(key)
+    # Existing workers re-check before every operation, even after pacing delay.
+    # Resumed accounts rejoin on the NEXT promotion round, not mid-round.
+    await q.answer("Promotion enabled; will join next round." if enabled else
+                   "Promotion stopped for this ID only.", show_alert=True)
+    fresh = await session_store.get_sessions()
+    buttons = []
+    lines = ["👤 <b>SESSIONS — PROMOTION CONTROL</b>\n"]
+    for r in fresh:
+        rsid = str(r["id"])
+        label = str(r.get("first_name") or r.get("label") or r.get("tg_user_id") or rsid)
+        is_on = r.get("promo_enabled", True)
+        lines.append(f"👤 {esc(label)} • <b>{'🟢 ON' if is_on else '🔴 OFF'}</b>")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{'⏸ Stop Promo' if is_on else '▶️ Resume Promo'} · {label[:18]}",
+                callback_data=f"sess_promo:{rsid}"),
+            InlineKeyboardButton("🗑 Remove", callback_data=f"sess_rm:{rsid}"),
+        ])
+    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                              reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def session_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3604,6 +3884,8 @@ def main():
     app.add_handler(CommandHandler("users", list_operators))
     app.add_handler(CommandHandler("start", authorized_handler(start)))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(per_id_reply_callback), pattern=r"^reply_id:[0-9a-fA-F]+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(session_promo_toggle), pattern=r"^sess_promo:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_cancel), pattern=r"^sess_rm_no:[0-9a-fA-F]+$"))

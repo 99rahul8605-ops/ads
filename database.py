@@ -498,6 +498,7 @@ class MongoSessionStore:
             "username": doc.get("username"),
             "first_name": doc.get("first_name"),
             "enabled": bool(doc.get("enabled", True)),
+            "promo_enabled": bool(doc.get("promo_enabled", True)),
             "auth_state": doc.get("auth_state", "active"),
             "auth_error": doc.get("auth_error"),
         }
@@ -516,6 +517,24 @@ class MongoSessionStore:
             return [self._serialize(d) for d in docs]
 
         return await asyncio.to_thread(_get)
+
+    async def set_promo_enabled(self, session_id: str, enabled: bool) -> bool:
+        """Toggle group promotion for one owner-scoped session, not the login/listener."""
+        from bson import ObjectId
+        from bson.errors import InvalidId
+
+        def _set():
+            try:
+                sid = ObjectId(session_id)
+            except (InvalidId, TypeError):
+                return False
+            result = self.collection.update_one(
+                {"$and": [self._owner_filter(), {"_id": sid}]},
+                {"$set": {"promo_enabled": bool(enabled), "updated_at": datetime.now(timezone.utc)}},
+            )
+            return bool(result.matched_count)
+
+        return await asyncio.to_thread(_set)
 
     async def mark_needs_relogin(self, session_id: str, error: str = "AuthKeyDuplicatedError"):
         from bson import ObjectId
