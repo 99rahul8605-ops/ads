@@ -38,7 +38,8 @@ from threading import Thread
 
 load_dotenv()
 
-Thread(target=start_server, daemon=True).start()
+if os.getenv("ENABLE_HTTP_SERVER", "false").lower() in ("true", "1", "yes", "on"):
+    Thread(target=start_server, daemon=True).start()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
@@ -3901,13 +3902,38 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def post_init(app: Application):
+    started = time.monotonic()
+    log.info("STARTUP: loading approved operators")
     await load_approved_users()
-    # Owner database and legacy encrypted sessions are never migrated/deleted.
-    for uid in sorted(APPROVED_USERS):
-        await initialize_tenant(uid)
-        await start_tenant_listener(app, uid)
-        await start_join_queue_service(app, uid)
-        await sync_bot_account_listeners(app, uid)
+    log.info("STARTUP: %s operators loaded in %.2fs",
+             len(APPROVED_USERS), time.monotonic() - started)
+
+    semaphore = asyncio.Semaphore(3)
+
+    async def setup_operator(uid):
+        async with semaphore:
+            t = time.monotonic()
+            log.info("STARTUP: operator %s initializing", uid)
+            try:
+                await initialize_tenant(uid)
+                log.info("STARTUP: operator %s DB ready in %.2fs",
+                         uid, time.monotonic() - t)
+
+                await start_tenant_listener(app, uid)
+                await start_join_queue_service(app, uid)
+                await sync_bot_account_listeners(app, uid)
+
+                log.info("STARTUP: operator %s READY in %.2fs",
+                         uid, time.monotonic() - t)
+            except Exception:
+                log.exception("STARTUP: operator %s failed", uid)
+
+    await asyncio.gather(
+        *(setup_operator(uid) for uid in sorted(APPROVED_USERS))
+    )
+
+    log.info("STARTUP: completed in %.2fs",
+             time.monotonic() - started)
 
 
 async def post_shutdown(app: Application):
