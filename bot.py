@@ -122,6 +122,7 @@ PROMOTION_MENU = ReplyKeyboardMarkup(
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📨 DM Broadcast"],
+        ["🗑 Delete Old Promo: ON/OFF"],
         ["⬅️ Back"],
     ],
     resize_keyboard=True,
@@ -1678,14 +1679,54 @@ async def send_saved_post(client: TelegramClient, entity, post: dict):
     if media_path:
         if not Path(media_path).exists():
             raise FileNotFoundError(f"Saved media missing: {media_path}")
-        await client.send_file(
+        return await client.send_file(
             entity,
             media_path,
             caption=text or None,
             parse_mode="html",
         )
     else:
-        await client.send_message(entity, text, parse_mode="html", link_preview=False)
+        return await client.send_message(entity, text, parse_mode="html", link_preview=False)
+
+
+def last_group_promo_key(session_id: str, entity) -> str:
+    # Separate persisted message ID per tenant, account and group.
+    group_id = getattr(entity, "channel_id", None)
+    if group_id is None:
+        group_id = getattr(entity, "chat_id", None)
+    if group_id is None:
+        raise ValueError("Expected a group peer for promotion cleanup")
+    return f"last_group_promo:{session_id}:{group_id}"
+
+
+async def send_group_post_with_cleanup(client, entity, post, session_id: str):
+    """Optionally delete only the previous tracked promo from this account."""
+    enabled = str(await db.get_setting("delete_old_group_promo", "false")).lower() in {
+        "true", "1", "yes", "on",
+    }
+    if not enabled:
+        return await send_saved_post(client, entity, post)
+
+    key = last_group_promo_key(session_id, entity)
+    previous = await db.get_setting(key, "")
+    if previous:
+        try:
+            await client.delete_messages(entity, [int(previous)])
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            log.warning("Could not delete previous promo for %s: %s",
+                        key, type(exc).__name__)
+
+    sent = await send_saved_post(client, entity, post)
+    if sent is not None and getattr(sent, "id", None) is not None:
+        try:
+            await db.set_setting(key, str(sent.id))
+        except Exception as exc:
+            # Already sent: don't retry and create a duplicate.
+            log.warning("Could not store latest promo message for %s: %s",
+                        key, type(exc).__name__)
+    return sent
 
 
 def pick_post(posts: list[dict], mode: str, index: int, round_number: int = 1, previous_id=None):
@@ -1732,7 +1773,11 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
                         sid,
                         lambda: run_with_connection_retry(
                             row,
-                            lambda active_client: send_saved_post(active_client, entity, post),
+                            lambda active_client: (
+                                send_group_post_with_cleanup(active_client, entity, post, sid)
+                                if target_type == "group"
+                                else send_saved_post(active_client, entity, post)
+                            ),
                             f"promotion to {name}",
                         ),
                     ),
@@ -3462,6 +3507,18 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=POST_SAVE_MENU,
         )
 
+    elif text == "🗑 Delete Old Promo: ON/OFF":
+        enabled = str(await db.get_setting("delete_old_group_promo", "false")).lower() in {"true", "1", "yes", "on"}
+        new_enabled = not enabled
+        await db.set_setting("delete_old_group_promo", "true" if new_enabled else "false")
+        await update.message.reply_text(
+            f"🗑 Delete old group promotion: {'ON ✅' if new_enabled else 'OFF ❌'}\n\n"
+            "When ON, before sending a new group promotion, each session removes only "
+            "its own last tracked promotion from that group. DMs and other messages "
+            "are untouched. Setting is saved across restarts.",
+            reply_markup=PROMOTION_MENU,
+        )
+
     elif text == "⏳ Group Delay":
         current_delay = await get_group_delay()
         state[uid] = "await_group_delay"
@@ -3618,7 +3675,7 @@ async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 Save Post", "📋 List Posts", "👁 Preview Post", "🔘 Toggle Post",
         "🗑 Delete Post", "🔀 Sending Mode", "📝 Posts", "📣 Promotion",
         "👥 Accounts", "💬 Auto Reply", "✏️ Edit/Set Bio", "📊 Monitoring",
-        "🔄 Rotate", "🎲 Random",
+        "🔄 Rotate", "🎲 Random", "🗑 Delete Old Promo: ON/OFF",
     }
     if m.text in reserved_buttons:
         context.user_data["post_saved_message_id"] = m.message_id
